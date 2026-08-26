@@ -73,6 +73,11 @@ gen = [
     "transformers==4.24.0",
 ]
 
+# Local interactive UI (app/gradio_app.py) -- not needed for training/Colab
+ui = [
+    "gradio>=3.40,<4.0",
+]
+
 
 # Development packages
 dev = [

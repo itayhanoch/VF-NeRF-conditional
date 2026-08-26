@@ -26,7 +26,35 @@ If you find this useful, please cite this work as follows:
 
 # About
 
-VF-NeRF is a method to register two NeRF scenes. We utilize Normalizing-flows to understand the scene and generate novel views and point-clouds.
+This fork repurposes VF-NeRF's Normalizing-Flow machinery away from NeRF-to-NeRF
+registration and toward **conditional novel-view generation**: a conditional
+RealNVP flow learns `P((3D point, 3D direction) | DINO feature)` against a single,
+**frozen** pretrained nerfacto NeRF (never fine-tuned during flow training), so that
+clicking a point in an image -- via its DINOv2 feature -- can generate plausible
+novel-view rays through that scene. The flow architecture is ported from
+[itayhanoch/conditional-normalizing-flows-toy](https://github.com/itayhanoch/conditional-normalizing-flows-toy),
+with its coupling-layer masking realigned to match the original VF-NeRF's
+position-vs-direction block split.
+
+The original registration pipeline (`reg_pipeline*.py`, `scripts/fgr.py`, the
+`register-nerfacto` method, etc.) has been removed; see the original
+[VF-NeRF paper](https://arxiv.org/pdf/2404.03349.pdf) and
+[leosegre/VF_NeRF](https://github.com/leosegre/VF_NeRF) for that use case.
+
+## Workflow
+
+1. **Train a frozen NeRF backbone** on your scene (or a nerfstudio example scene)
+   with plain `ns-train nerfacto` -- see "Preparing your data" below. This NeRF is
+   trained once and never touched again.
+2. **Train the conditional Normalizing Flow** against that frozen NeRF, conditioned
+   on DINOv2 features -- `scripts/train_conditional_nf.py`, meant to run on a
+   Colab GPU (see [`notebooks/train_conditional_nf_colab.ipynb`](notebooks/train_conditional_nf_colab.ipynb)).
+   This is a standalone training loop, decoupled from nerfstudio's `Trainer`/`Pipeline`.
+3. **Explore interactively**, locally, once both checkpoints are downloaded --
+   `app/gradio_app.py` (`pip install -e ".[ui]"` first): pick a training image (or
+   upload an external one), click a point, and the conditional NF samples 100
+   `(position, direction)` candidates ranked by likelihood; pick 1-5 to render as
+   novel views through the frozen NeRF.
 
 ## 1. Installation: Setup the environment
 
@@ -71,38 +99,46 @@ cd ..
 ```
 
 ## 2. Preparing your data
-Assuming you have a video or a set of images, run COLMAP to get a valid transform.json
+
+Assuming you have a video or a set of images, run COLMAP to get a valid `transforms.json`:
 ````bash
 ns-process-data {video,images} --data {DATA_PATH} --output-dir {PROCESSED_DATA_DIR}
 ````
-
-Once you have a valid transform.json and a set of images, use can split it into two sets manually or use our script
+Or use one of nerfstudio's bundled example scenes to try the pipeline end-to-end
+without your own capture:
 ````bash
-python scripts/split_transform_file.py {directory} {min_bound} {max_bound} {even_odd}
-# For example
-python scripts/split_transform_file.py data/trex 30 70 True
-````
-Alternativly split using k-means:
-````bash
-python scripts/split_transform_file_objaverse.py {directory}/
+ns-download-data nerfstudio --capture-name=poster
 ````
 
+## 3. Train the frozen NeRF backbone
 
-## 2. Register the two NeRFs
-
-First you need to run VF-NeRF to create the two NeRFs, then you can run the registraion process. Use our script to create the NeRFs and register them. 
-If you already have two pretrained VF-NeRFs you can run the registration procees by setting the timestamp of the pretrained NeRFs.
 ```bash
-
-python reg_pipeline_pc.py {data_dir} {outputs_dir} {scene_names} {scene_types} {downscale_factor} {timestamp(optional)}
-# For example
-python reg_pipeline_pc.py data/ outputs/ trex 0_100_even_odd 2
+ns-train nerfacto --data {PROCESSED_DATA_DIR}
 ```
+This uses the `TCNNNerfactoField` (tiny-cuda-nn) backbone, matching upstream
+nerfstudio/VF-NeRF -- see "Dependencies" above for the tiny-cuda-nn build step
+(also required on Colab; the training notebook handles it).
 
-### Generate Point Cloud fast using VF-NeRF
+## 4. Train the conditional Normalizing Flow
 
 ```bash
-ns-export nf-pointcloud --help
+python scripts/train_conditional_nf.py \
+    --nerf-config {outputs_dir}/{scene}/nerfacto/{timestamp}/config.yml \
+    --scene-dir {PROCESSED_DATA_DIR} \
+    --checkpoint-dir checkpoints/conditional_nf/{scene}
+```
+This is a standalone script (not `ns-train`) meant to run on a Colab GPU for real
+training runs -- see [`notebooks/train_conditional_nf_colab.ipynb`](notebooks/train_conditional_nf_colab.ipynb),
+which handles Drive-mounted checkpointing so training survives disconnects.
+
+## 5. Explore interactively
+
+```bash
+pip install -e ".[ui]"
+python app/gradio_app.py \
+    --nerf-config {outputs_dir}/{scene}/nerfacto/{timestamp}/config.yml \
+    --cond-nf-checkpoint checkpoints/conditional_nf/{scene}/latest.pt \
+    --scene-dir {PROCESSED_DATA_DIR}
 ```
 
 
