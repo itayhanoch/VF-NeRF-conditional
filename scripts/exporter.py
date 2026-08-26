@@ -15,7 +15,6 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import open3d as o3d
-import pathlib
 import torch
 import tyro
 from rich.console import Console
@@ -26,10 +25,7 @@ from nerfstudio.exporter import texture_utils, tsdf_utils
 from nerfstudio.exporter.exporter_utils import (
     collect_camera_poses,
     generate_point_cloud,
-    generate_point_cloud_nf,
-    generate_cameras_from_nf,
     get_mesh_from_filename,
-    render_trajectory,
 )
 from nerfstudio.exporter.marching_cubes import (
     generate_mesh_with_multires_marching_cubes,
@@ -37,13 +33,7 @@ from nerfstudio.exporter.marching_cubes import (
 from nerfstudio.pipelines.base_pipeline import Pipeline, VanillaPipeline
 from nerfstudio.utils.eval_utils import eval_setup
 
-from nerfstudio.cameras.cameras import CAMERA_MODEL_TO_TYPE, Cameras, CameraType
-import cv2 as cv
-
-from nerfstudio.utils.io import load_from_json
 from nerfstudio.utils import colormaps
-
-from nerfstudio.exporter.exporter_utils import get_mask_from_view_likelihood
 
 
 CONSOLE = Console(width=120)
@@ -119,222 +109,6 @@ class ExportPointCloud(Exporter):
         o3d.t.io.write_point_cloud(str(self.output_dir / "point_cloud.ply"), tpcd)
         print("\033[A\033[A")
         CONSOLE.print("[bold green]:white_check_mark: Saving Point Cloud")
-@dataclass
-class ExportPointCloudNF(Exporter):
-    """Export NeRF as a point cloud from Normalizing flow."""
-
-    num_points: int = 1000000
-    """Number of points to generate. May result in less if outlier removal is used."""
-    remove_outliers: bool = True
-    """Remove outliers from the point cloud."""
-    use_bounding_box: bool = True
-    """Only query points within the bounding box"""
-    bounding_box_min: Tuple[float, float, float] = (-1, -1, -1)
-    """Minimum of the bounding box, used if use_bounding_box is True."""
-    bounding_box_max: Tuple[float, float, float] = (1, 1, 1)
-    """Maximum of the bounding box, used if use_bounding_box is True."""
-    std_ratio: float = 10.0
-    """Threshold based on STD of the average distances across the point cloud to remove outliers."""
-    seed: int = 42
-    threshold: float = 10.0
-
-    def main(self) -> None:
-        """Export point cloud."""
-
-        np.random.seed(self.seed)
-        torch.manual_seed(self.seed)
-        torch.cuda.manual_seed(self.seed)
-        torch.cuda.manual_seed_all(self.seed)
-
-        if not self.output_dir.exists():
-            self.output_dir.mkdir(parents=True)
-
-        _, pipeline, _, _ = eval_setup(self.load_config)
-
-        # # Increase the batchsize to speed up the evaluation.
-        # pipeline.datamanager.train_pixel_sampler.num_rays_per_batch = self.num_rays_per_batch
-
-        pcd = generate_point_cloud_nf(
-            pipeline=pipeline,
-            num_points=self.num_points,
-            remove_outliers=self.remove_outliers,
-            use_bounding_box=self.use_bounding_box,
-            bounding_box_min=self.bounding_box_min,
-            bounding_box_max=self.bounding_box_max,
-            std_ratio=self.std_ratio,
-            threshold=self.threshold,
-        )
-        torch.cuda.empty_cache()
-
-        CONSOLE.print(f"[bold green]:white_check_mark: Generated {pcd}")
-        CONSOLE.print("Saving Point Cloud...")
-        tpcd = o3d.t.geometry.PointCloud.from_legacy(pcd)
-        # The legacy PLY writer converts colors to UInt8,
-        # let us do the same to save space.
-        tpcd.point.colors = (tpcd.point.colors * 255).to(o3d.core.Dtype.UInt8)
-        o3d.t.io.write_point_cloud(str(self.output_dir / "point_cloud.ply"), tpcd)
-        print("\033[A\033[A")
-        CONSOLE.print("[bold green]:white_check_mark: Saving Point Cloud")
-
-@dataclass
-class ExportTransformsNF(Exporter):
-    """Export transform matrices from Normalizing flow."""
-
-    num_points: int = 10
-    """Number of points to generate. May result in less if outlier removal is used."""
-    min_depth: float = 0.7
-    """depth: The depth of the camera."""
-    max_depth: float = 1.2
-    """depth: The depth of the camera."""
-    downscale_factor: int = 1
-    depth_output_name: str = "depth"
-    rgb_output_name: str = "rgb"
-    mask_output_name: str = "mask"
-    view_likelihood_output_name: str = "view_log_likelihood"
-    generate_masks: bool = True
-    num_depth_points: int = 1
-    seed: int = 42
-    near_plane: float = None
-    far_plane: float = None
-    threshold: float = 0.05
-    sample_ratio: int = 10
-
-
-    def main(self) -> None:
-        """Export transform matrices."""
-
-        np.random.seed(self.seed)
-        torch.manual_seed(self.seed)
-        torch.cuda.manual_seed(self.seed)
-        torch.cuda.manual_seed_all(self.seed)
-
-        if not self.output_dir.exists():
-            self.output_dir.mkdir(parents=True)
-
-        _, pipeline, _, _ = eval_setup(self.load_config, near_plane=self.near_plane, far_plane=self.far_plane)
-
-
-
-        device = pipeline.device
-
-        # # Increase the batchsize to speed up the evaluation.
-        # pipeline.datamanager.train_pixel_sampler.num_rays_per_batch = self.num_rays_per_batch
-        dataparser_transforms = load_from_json(pathlib.Path(os.path.join(os.path.dirname(self.load_config), "dataparser_transforms.json")))
-        # print(dataparser_transforms)
-
-        transforms, c2w = generate_cameras_from_nf(
-            pipeline=pipeline,
-            dataparser_transforms=dataparser_transforms,
-            num_points=self.num_points,
-            min_depth=self.min_depth,
-            max_depth=self.max_depth,
-            generate_masks=self.generate_masks,
-            num_depth_points=self.num_depth_points,
-            sample_ratio=self.sample_ratio,
-        )
-        torch.cuda.empty_cache()
-
-
-        distortion_params = torch.zeros((self.num_points*self.num_depth_points, 6))
-        cameras = Cameras(
-            fx=transforms["fl_x"],
-            fy=transforms["fl_y"],
-            cx=transforms["cx"],
-            cy=transforms["cy"],
-            distortion_params=distortion_params,
-            height=transforms["h"],
-            width=transforms["w"],
-            camera_to_worlds=c2w[:, :3, :4],
-            camera_type=CameraType.PERSPECTIVE,
-        )
-
-        color_images, depth_images, view_likelihood_images = render_trajectory(
-            pipeline,
-            cameras,
-            rgb_output_name=self.rgb_output_name,
-            depth_output_name=self.depth_output_name,
-            view_likelihood_output_name=self.view_likelihood_output_name,
-            rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
-            disable_distortion=True,
-        )
-
-        color_images = 255 * torch.tensor(np.array(color_images), device=device).cpu().numpy()  # shape (N, 3, H, W)
-        depth_images = 255 * torch.tensor(np.array(depth_images), device=device).cpu().numpy()  # shape (N, 1, H, W)
-        view_likelihood_images = torch.tensor(np.array(view_likelihood_images), device=device)  # shape (N, 1, H, W)
-
-        images_dir = "images"
-        if self.downscale_factor > 1:
-            images_dir = images_dir + "_" + str(self.downscale_factor)
-        images_dir = os.path.join(self.output_dir, images_dir)
-        if not os.path.exists(images_dir):
-            os.mkdir(images_dir)
-
-        masks_dir = "masks"
-        if self.downscale_factor > 1:
-            masks_dir = masks_dir + "_" + str(self.downscale_factor)
-        masks_dir = os.path.join(self.output_dir, masks_dir)
-        if not os.path.exists(masks_dir):
-            os.mkdir(masks_dir)
-
-        best_viewshed = 0
-        depth_list = []
-        best_depth = 0
-
-
-        for i in range(view_likelihood_images.shape[0]):
-            output_viewshed = view_likelihood_images[i]
-            min_value = torch.min(output_viewshed[~torch.isnan(output_viewshed)])
-            # Replace NaN values with the minimum non-NaN value
-            output_viewshed[torch.isnan(output_viewshed)] = min_value
-            output_viewshed = torch.exp(output_viewshed)
-
-            viewshed = output_viewshed.sum()
-
-            print("viewshed", viewshed)
-            if viewshed > best_viewshed:
-                best_viewshed = viewshed
-                best_depth = i
-            if (i % self.num_depth_points) == (self.num_depth_points - 1):
-                depth_list.append(best_depth)
-                best_viewshed = 0
-
-        print(depth_list)
-
-        transforms["frames"] = [transforms["frames"][i] for i in depth_list]
-        color_images = color_images[depth_list]
-        depth_images = depth_images[depth_list]
-        view_likelihood_images = view_likelihood_images[depth_list]
-
-
-        mask_output, output_colormap = get_mask_from_view_likelihood(view_likelihood_images, threshold=self.threshold)
-
-        for i in reversed(range(self.num_points)):
-
-            # if (mask_output.sum() / (255 * mask_output.size)) <= 0.5:
-            #     transforms["frames"].pop(i)
-
-            cv.imwrite(f"{masks_dir}/{self.mask_output_name}_{i}.png", mask_output[i])
-            cv.imwrite(f"{images_dir}/{self.view_likelihood_output_name}_{i}.png", output_colormap[i])
-
-            color_images[i] = cv.cvtColor(color_images[i], cv.COLOR_BGR2RGB)
-            cv.imwrite(f"{images_dir}/{self.rgb_output_name}_{i}.png", color_images[i])
-            cv.imwrite(f"{images_dir}/{self.depth_output_name}_{i}.png", depth_images[i])
-
-
-
-        for file_name, frames in [("transforms.json", transforms)]:
-            if len(frames) == 0:
-                CONSOLE.print(f"[bold yellow]No frames found for {file_name}. Skipping.")
-                continue
-
-            output_file_path = os.path.join(self.output_dir, file_name)
-
-            with open(output_file_path, "w", encoding="UTF-8") as f:
-                json.dump(frames, f, indent=4)
-
-            CONSOLE.print(f"[bold green]:white_check_mark: Saved poses to {output_file_path}")
-
-
 
 @dataclass
 class ExportTSDFMesh(Exporter):
@@ -639,12 +413,10 @@ class ExportCameraPoses(Exporter):
 Commands = tyro.conf.FlagConversionOff[
     Union[
         Annotated[ExportPointCloud, tyro.conf.subcommand(name="pointcloud")],
-        Annotated[ExportPointCloudNF, tyro.conf.subcommand(name="nf-pointcloud")],
         Annotated[ExportTSDFMesh, tyro.conf.subcommand(name="tsdf")],
         Annotated[ExportPoissonMesh, tyro.conf.subcommand(name="poisson")],
         Annotated[ExportMarchingCubesMesh, tyro.conf.subcommand(name="marching-cubes")],
         Annotated[ExportCameraPoses, tyro.conf.subcommand(name="cameras")],
-        Annotated[ExportTransformsNF, tyro.conf.subcommand(name="nf-cameras")],
     ]
 ]
 

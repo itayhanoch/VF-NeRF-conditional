@@ -74,7 +74,7 @@ class NerfstudioDataParserConfig(DataParserConfig):
     alpha_color: str = None
     """alpha color of background"""
     objaverse_transform_matrix: str = None
-    """matrix number of registration data."""
+    """Key into world_frame_transforms.json naming which transform to apply to reorient objaverse poses into a canonical world frame."""
 
 
 
