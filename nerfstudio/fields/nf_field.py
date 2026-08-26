@@ -1,157 +1,74 @@
-# Copyright 2022 The Nerfstudio Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""Conditional Normalizing Flow field.
 
+Models P((3D position, 3D direction) | condition) via a conditional RealNVP, so that a
+condition vector (a DINOv2 feature taken at some source-image pixel) can be sampled into
+plausible novel-view ray candidates. The flow itself is ported from
+itayhanoch/conditional-normalizing-flows-toy -- see nerfstudio/field_components/condflow.py.
 """
-Field for compound Normalizing Flow
-"""
-
-
-from typing import Dict, Optional, Tuple
-
-import numpy as np
 import torch
 from torch import nn
-from torch.nn.parameter import Parameter
-from torchtyping import TensorType
 
-from nerfstudio.cameras.rays import RaySamples
-from nerfstudio.data.scene_box import SceneBox
-from nerfstudio.field_components.activations import trunc_exp
-from nerfstudio.field_components.embedding import Embedding
-from nerfstudio.field_components.encodings import Encoding, HashEncoding, SHEncoding
-from nerfstudio.field_components.field_heads import (
-    DensityFieldHead,
-    FieldHead,
-    FieldHeadNames,
-    PredNormalsFieldHead,
-    DirectionsFieldHead,
-    RGBFieldHead,
-    SemanticFieldHead,
-    TransientDensityFieldHead,
-    TransientRGBFieldHead,
-    UncertaintyFieldHead,
-    # ViewLikelihoodFieldHead,
-)
-from nerfstudio.field_components.mlp import MLP
-from nerfstudio.field_components.spatial_distortions import (
-    SceneContraction,
-    SpatialDistortion,
-)
-from nerfstudio.fields.base_field import Field, shift_directions_for_tcnn
-import normflows as nf
+from nerfstudio.field_components.condflow import get_generator
 
 
-
-class NFField(Field):
-    """Compound Field
+class ConditionalNFField(nn.Module):
+    """Conditional RealNVP over 6D (position, direction) vectors, conditioned on a
+    context vector (e.g. a DINOv2 feature at the source pixel a ray passes through).
 
     Args:
-        num_layers: number of NF layers
-        num_dims: dimension of Gaussian
-        hidden_dim: dimension of hidden layers
+        context_dim: dimensionality of the condition vector (384 for dinov2_vits14).
+        num_dims: dimensionality of the modeled vector (3D position + 3D direction = 6).
+        num_blocks: number of coupling+batchnorm blocks (toy repo's real-data
+            `dual_cond_rgb` variant uses 8 for a 2D/3-cond-dim problem).
+        hidden_dim: hidden width of each coupling layer's scale/translate MLPs.
+        cond_prior: also condition the base distribution's mean/log-var on `context`
+            (the toy repo's best-performing "dual_cond" variant).
+        use_cond_in_coupling: condition each coupling layer's scale/translate nets.
+        use_batchnorm: interleave BatchNormFlow layers between couplings.
     """
 
     def __init__(
         self,
-        num_layers: int = 4,
+        context_dim: int,
         num_dims: int = 6,
+        num_blocks: int = 8,
         hidden_dim: int = 128,
+        cond_prior: bool = True,
+        use_cond_in_coupling: bool = True,
+        use_batchnorm: bool = True,
+        device: str = "cuda",
     ) -> None:
         super().__init__()
+        self.context_dim = context_dim
+        self.num_dims = num_dims
+        self.flow = get_generator(
+            num_inputs=num_dims,
+            num_cond_inputs=context_dim,
+            device=device,
+            num_blocks=num_blocks,
+            num_hidden=hidden_dim,
+            cond_prior=cond_prior,
+            use_cond_in_coupling=use_cond_in_coupling,
+            use_batchnorm=use_batchnorm,
+        )
 
+    def log_prob(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """x: [B, num_dims] (position, direction). context: [B, context_dim].
+        Returns [B, 1] log-density."""
+        return self.flow.log_prob(x, context)
 
-        # view likelihood
-        # num_dims = self.direction_encoding.n_output_dims + self.position_encoding.n_output_dims
+    def sample(self, num_samples: int, context: torch.Tensor) -> torch.Tensor:
+        """Draw `num_samples` (position, direction) points conditioned on `context`.
 
-        # Define 6D Gaussian base distribution
-        base = nf.distributions.base.DiagGaussian(num_dims)
+        `context` may be a single [context_dim] vector (broadcast to every sample --
+        the interactive-UI "click one point -> sample N" case) or an already-batched
+        [num_samples, context_dim] tensor (the training case, one condition per ray).
 
-        # Define list of flows
-        flows = []
-        for i in range(num_layers):
-            # Neural network with two hidden layers having 64 units each
-            # Last layer is initialized by zeros making training more stable
-            # param_map = nf.nets.MLP([3, 64, 64, 6], init_zeros=True)
-            param_map = nf.nets.MLP([int(num_dims/2), hidden_dim, hidden_dim, num_dims], init_zeros=True, leaky=0.1, dropout=0.2)
-            # param_map = nf.nets.MLP([int(num_dims/2), hidden_dim, hidden_dim, num_dims], init_zeros=True)
-            # Add flow layer
-            flows.append(nf.flows.AffineCouplingBlock(param_map, scale_map="exp"))
-            # Swap dimensions
-            flows.append(nf.flows.Permute(num_dims, mode='swap'))
-
-        self.nf_model = nf.NormalizingFlow(base, flows)
-
-        # nf_args = get_args()
-        # self.nf_model = get_point_cnf(nf_args)
-        # print(self.nf_model)
-
-
-    def get_outputs(
-        # self, ray_samples: RaySamples, density_embedding: Optional[TensorType] = None
-        self, positions, directions
-    ) -> Dict[FieldHeadNames, TensorType]:
-        outputs = {}
-        # if ray_samples.camera_indices is None:
-        #     raise AttributeError("Camera indices are not provided.")
-
-        # outputs_shape = ray_samples.frustums.directions.shape[:-1]
-        outputs_shape = directions.shape[:-1]
-        # directions = shift_directions_for_tcnn(ray_samples.frustums.directions)
-
-        # predicted view likelihood
-
-        # positions = ray_samples.frustums.get_positions().view(-1, 3)
-        positions = positions.view(-1, 3)
-
-        # positions = self.position_encoding(positions).to(dtype=torch.float32)
-
-        # dirs = shift_directions_for_tcnn(ray_samples.frustums.directions).contiguous().view(-1, 3)
-
-        # dirs = shift_directions_for_tcnn(directions).contiguous().view(-1, 3)
-        dirs = directions.contiguous().view(-1, 3)
-
-        # dirs = self.direction_encoding(dirs).to(dtype=torch.float32)
-        # print(positions.shape)
-        # print(dirs.shape)
-        # positions_flat = self.position_encoding(positions.view(-1, 3))
-        # view_likelihood_inp = torch.cat([d, positions_flat], dim=-1)
-        view_likelihood_inp = torch.cat([positions, dirs], dim=-1)
-
-        # x = self.mlp_view_likelihood(view_likelihood_inp).view(*outputs_shape, -1).to(directions)
-        # print(view_likelihood_inp.shape)
-        # import ipdb; ipdb.set_trace()
-        # print(view_likelihood_inp.shape)
-
-
-        outputs[FieldHeadNames.VIEW_LOG_LIKELIHOOD] = self.nf_model.log_prob(view_likelihood_inp).view(*outputs_shape, -1).to(directions)
-
-        # # Compute the reconstruction likelihood P(X|z)
-        # batch_size = view_likelihood_inp.size(0)
-        # num_points = 1
-        # y, delta_log_py = self.nf_model(view_likelihood_inp.unsqueeze(1), None, torch.zeros(batch_size, num_points, 1).to(view_likelihood_inp))
-        # # log_py = standard_normal_logprob(y).view(batch_size, -1).sum(1, keepdim=True)
-        # # delta_log_py = delta_log_py.view(batch_size, num_points, 1).sum(1)
-        # log_py = standard_normal_logprob(y).view(batch_size, -1).sum(1, keepdim=True)
-        # delta_log_py = delta_log_py.view(batch_size, num_points, 1).sum(1)
-        # log_px = log_py - delta_log_py
-
-        # outputs[FieldHeadNames.VIEW_LOG_LIKELIHOOD] = log_px.view(*outputs_shape, -1).to(directions)
-
-
-        # with torch.no_grad():
-        #     outputs[FieldHeadNames.VIEW_LIKELIHOOD] = torch.exp(outputs[FieldHeadNames.VIEW_LOG_LIKELIHOOD])
-        # print(x)
-        # .view(*outputs_shape, -1).to(directions)
-
-        return outputs
+        Returns [num_samples, num_dims]. Unlike normflows' `.sample()`, this does NOT
+        also return a log-probability -- call `log_prob(samples, context)` separately
+        to rank/score the drawn samples (matches the ported flow's own
+        `FlowSequential.sample` signature).
+        """
+        if context.dim() == 1:
+            context = context.unsqueeze(0).expand(num_samples, -1)
+        return self.flow.sample(num_samples=num_samples, cond_inputs=context)
