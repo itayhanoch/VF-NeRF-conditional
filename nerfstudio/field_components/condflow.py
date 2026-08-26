@@ -206,7 +206,15 @@ def get_generator(
             bound=log_var_bound,
         )
     coupling_cond_dim = num_cond_inputs if use_cond_in_coupling else None
-    mask = (torch.arange(0, num_inputs) % 2).to(device).float()
+    # Contiguous half-block mask, matching the original (unconditional) VF-NeRF
+    # NFField: its normflows-based AffineCouplingBlock used Split(mode="channel")
+    # -- z.chunk(2, dim=1), a position-vs-direction block split, not an element-
+    # wise alternating/checkerboard mask -- alternated across layers by a
+    # Permute(mode="swap") that swaps the two halves wholesale. Flipping this same
+    # block mask each iteration (mask = 1 - mask below) reproduces that alternation
+    # without physically reordering the vector's storage.
+    first_block_size = (num_inputs + 1) // 2
+    mask = torch.cat([torch.ones(first_block_size), torch.zeros(num_inputs - first_block_size)]).to(device).float()
     for _ in range(num_blocks):
         modules += [CouplingLayer(num_inputs, num_hidden, mask, coupling_cond_dim, log_s_max=log_s_max)]
         if use_batchnorm:
