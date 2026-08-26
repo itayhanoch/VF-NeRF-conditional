@@ -35,8 +35,6 @@ class TrainingCallbackAttributes:
     """optimizers for training"""
     grad_scaler: Optional[InitVar]
     """gradient scalers"""
-    nf_grad_scaler: Optional[InitVar]
-    """gradient scalers"""
     pipeline: Optional[InitVar]
     """reference to training pipeline"""
 
