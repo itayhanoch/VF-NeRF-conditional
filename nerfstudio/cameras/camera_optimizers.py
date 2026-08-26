@@ -79,7 +79,6 @@ class CameraOptimizer(nn.Module):
         config: CameraOptimizerConfig,
         num_cameras: int,
         device: Union[torch.device, str],
-        registration: bool = False,
         scale_opt: bool = False,
         **kwargs,  # pylint: disable=unused-argument
     ) -> None:
@@ -87,23 +86,17 @@ class CameraOptimizer(nn.Module):
         self.config = config
         self.num_cameras = num_cameras
         self.device = device
-        self.registration = registration
         self.scale_opt = scale_opt
 
         # Initialize learnable parameters.
         if self.config.mode == "off":
             pass
         elif self.config.mode in ("SO3xR3", "SE3"):
-            if self.registration:
-                self.pose_adjustment = torch.nn.Parameter(torch.zeros((1, 6), device=device))
-            else:
-                self.pose_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 6), device=device))
+            self.pose_adjustment = torch.nn.Parameter(torch.zeros((num_cameras, 6), device=device))
             if self.scale_opt:
                 self.pose_adjustment_scale = torch.nn.Parameter(torch.ones((1, 1), device=device))
         else:
             assert_never(self.config.mode)
-
-        self.t0 = torch.eye(4, device=device)
 
         # Initialize pose noise; useful for debugging.
         if config.position_noise_std != 0.0 or config.orientation_noise_std != 0.0:
@@ -128,17 +121,12 @@ class CameraOptimizer(nn.Module):
         """
         outputs = []
 
-        # if self.registration:
-        #     indices = torch.zeros_like(torch.tensor(indices))
         # Apply learned transformation delta.
-
         if self.config.mode == "off":
             pass
         elif self.config.mode == "SO3xR3":
-            outputs.append(self.t0)
             outputs.append(exp_map_SO3xR3(self.pose_adjustment[indices, :]))
         elif self.config.mode == "SE3":
-            outputs.append(self.t0)
             outputs.append(exp_map_SE3(self.pose_adjustment[indices, :]))
         else:
             assert_never(self.config.mode)
@@ -159,5 +147,4 @@ class CameraOptimizer(nn.Module):
             # Note that using repeat() instead of tile() here would result in unnecessary copies.
             return torch.eye(4, device=self.device)[None, :3, :4].tile(indices.shape[0], 1, 1)
 
-        # outputs = pose_utils.multiply(outputs, self.t0)
         return functools.reduce(pose_utils.multiply, outputs)

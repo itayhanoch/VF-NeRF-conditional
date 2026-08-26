@@ -47,7 +47,7 @@ class InputDataset(Dataset):
         scale_factor: The scaling factor for the dataparser outputs
     """
 
-    def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0, registration=False):
+    def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0):
         super().__init__()
         self._dataparser_outputs = dataparser_outputs
         self.has_masks = dataparser_outputs.mask_filenames is not None
@@ -56,7 +56,6 @@ class InputDataset(Dataset):
         self.metadata = deepcopy(dataparser_outputs.metadata)
         self.cameras = deepcopy(dataparser_outputs.cameras)
         self.cameras.rescale_output_resolution(scaling_factor=scale_factor)
-        self.registration = registration
 
     def __len__(self):
         return len(self._dataparser_outputs.image_filenames)
@@ -110,29 +109,6 @@ class InputDataset(Dataset):
             assert (
                 data["mask"].shape[:2] == data["image"].shape[:2]
             ), f"Mask and image have different shapes. Got {data['mask'].shape[:2]} and {data['image'].shape[:2]}"
-        # elif self.registration:
-        #     sift = cv.SIFT_create()
-        #
-        #     image = cv.cvtColor(image.cpu().numpy(), cv.COLOR_BGR2GRAY)
-        #     image = cv.normalize(image, None, 0, 255, cv.NORM_MINMAX).astype('uint8')
-        #
-        #     kp = sift.detect(image, None)
-        #     mask = np.zeros((image.shape[0], image.shape[1]))
-        #     for point in kp:
-        #         y = int(point.pt[0])
-        #         x = int(point.pt[1])
-        #         mask[x, y] = 1
-        #     kernel = np.ones((13, 13), np.uint8)
-        #     mask = cv.dilate(mask, kernel, iterations=5)
-        #     data["mask"] = torch.from_numpy(mask)
-        #
-        #     cv.imwrite(
-        #         f"/home/leo/nerfstudio_reg/nerfstudio/check/image_idx_{image_idx}.png",
-        #         image)
-        #     cv.imwrite(
-        #         f"/home/leo/nerfstudio_reg/nerfstudio/check/mask_idx_{image_idx}.png",
-        #         (data["mask"].cpu().numpy())*255)
-
         metadata = self.get_metadata(data)
         data.update(metadata)
         return data

@@ -176,17 +176,13 @@ class EvalDataloader(DataLoader):
         """
         return self.cameras[image_idx]
 
-    def get_data_from_image_idx(self, image_idx: int, registration: bool=False, ray_generator = None) -> Tuple[RayBundle, Dict]:
+    def get_data_from_image_idx(self, image_idx: int) -> Tuple[RayBundle, Dict]:
         """Returns the data for a specific image index.
 
         Args:
             image_idx: Camera image index
         """
-        if registration:
-            camera_opt_to_camera = self.ray_generator.pose_optimizer([0])
-            ray_bundle = self.cameras.generate_rays(camera_indices=image_idx, keep_shape=True, camera_opt_to_camera=camera_opt_to_camera)
-        else:
-            ray_bundle = self.cameras.generate_rays(camera_indices=image_idx, keep_shape=True)
+        ray_bundle = self.cameras.generate_rays(camera_indices=image_idx, keep_shape=True)
         batch = self.input_dataset[image_idx]
         batch = get_dict_to_torch(batch, device=self.device, exclude=["image"])
         return ray_bundle, batch
@@ -206,8 +202,6 @@ class FixedIndicesEvalDataloader(EvalDataloader):
         input_dataset: InputDataset,
         image_indices: Optional[Tuple[int]] = None,
         device: Union[torch.device, str] = "cpu",
-        registration: bool = False,
-        ray_generator=None,
         **kwargs,
     ):
         super().__init__(input_dataset, device, **kwargs)
@@ -216,10 +210,6 @@ class FixedIndicesEvalDataloader(EvalDataloader):
         else:
             self.image_indices = image_indices
         self.count = 0
-        self.registration = registration
-        self.ray_generator = ray_generator
-
-
 
     def __iter__(self):
         self.count = 0
@@ -228,7 +218,7 @@ class FixedIndicesEvalDataloader(EvalDataloader):
     def __next__(self):
         if self.count < len(self.image_indices):
             image_idx = self.image_indices[self.count]
-            ray_bundle, batch = self.get_data_from_image_idx(image_idx, self.registration, self.ray_generator)
+            ray_bundle, batch = self.get_data_from_image_idx(image_idx)
             self.count += 1
             return ray_bundle, batch
         raise StopIteration
@@ -246,14 +236,10 @@ class RandIndicesEvalDataloader(EvalDataloader):
         self,
         input_dataset: InputDataset,
         device: Union[torch.device, str] = "cpu",
-        registration: bool = False,
-        ray_generator=None,
         **kwargs,
     ):
         super().__init__(input_dataset, device, **kwargs)
         self.count = 0
-        self.registration = registration
-        self.ray_generator = ray_generator
 
     def __iter__(self):
         self.count = 0
@@ -263,7 +249,7 @@ class RandIndicesEvalDataloader(EvalDataloader):
         if self.count < 1:
             image_indices = range(self.cameras.size)
             image_idx = random.choice(image_indices)
-            ray_bundle, batch = self.get_data_from_image_idx(image_idx, self.registration, self.ray_generator)
+            ray_bundle, batch = self.get_data_from_image_idx(image_idx)
             self.count += 1
             return ray_bundle, batch
         raise StopIteration

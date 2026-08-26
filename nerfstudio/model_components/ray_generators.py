@@ -51,11 +51,7 @@ class RayGenerator(nn.Module):
         x = ray_indices[:, 2]  # col indices
         coords = self.image_coords[y, x]
 
-        if self.pose_optimizer.registration:
-            camera_opt_to_camera = self.pose_optimizer([0])
-            camera_opt_to_camera = camera_opt_to_camera.tile((c.shape[0], 1, 1))
-        else:
-            camera_opt_to_camera = self.pose_optimizer(c)
+        camera_opt_to_camera = self.pose_optimizer(c)
 
         ray_bundle = self.cameras.generate_rays(
             camera_indices=c.unsqueeze(-1),

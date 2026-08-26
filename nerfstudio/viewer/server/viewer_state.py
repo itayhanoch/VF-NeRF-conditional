@@ -54,11 +54,9 @@ from nerfstudio.viewer.viser.messages import (
     TimeConditionMessage,
     TrainingStateMessage,
 )
-import nerfstudio.utils.poses as pose_utils
 from nerfstudio.data.datamanagers.base_datamanager import (
     DataManager,
     DataManagerConfig,
-    VanillaDataManager,
     VanillaDataManagerConfig,
 )
 
@@ -283,7 +281,7 @@ class ViewerState:
         # draw indices, roughly evenly spaced
         return np.linspace(0, total_num - 1, num_display_images, dtype=np.int32).tolist()
 
-    def init_scene(self, dataset: InputDataset, registration=False, train_state=Literal["training", "paused", "completed"]) -> None:
+    def init_scene(self, dataset: InputDataset, train_state=Literal["training", "paused", "completed"]) -> None:
         """Draw some images and the scene aabb in the viewer.
 
         Args:
@@ -303,16 +301,6 @@ class ViewerState:
             bgr = image[..., [2, 1, 0]]
             camera_json = dataset.cameras.to_json(camera_idx=idx, image=bgr, max_size=100)
             self.viser_server.add_dataset_image(idx=f"{idx:06d}", json=camera_json)
-            if registration:
-                registration_matrix = dataset.metadata["registration_matrix"]
-                self.viser_server.add_dataset_image(idx=f"{idx:06d}_unreg", json=camera_json)
-                original_camera_json = camera_json.copy()
-                camera_to_world_tensor = torch.cat((torch.from_numpy(np.array(original_camera_json["camera_to_world"], dtype=np.float32)), \
-                                                    torch.tensor([[0, 0, 0, 1]], dtype=torch.float32)), 0)
-
-                original_camera_json["camera_to_world"] = pose_utils.multiply(registration_matrix, camera_to_world_tensor).tolist()
-                self.viser_server.add_dataset_image(idx=f"{idx:06d}_original", json=original_camera_json)
-
 
         # draw the scene box (i.e., the bounding box)
         self.viser_server.update_scene_box(dataset.scene_box)
@@ -321,44 +309,6 @@ class ViewerState:
         # set the initial state whether to train or not
         self.train_btn_state = train_state
         self.viser_server.set_training_state(train_state)
-
-    def update_register_cameras(self, datamanager: VanillaDataManager, step, pre_train=False) -> None:
-        """Draw new register images in the viewer.
-
-        Args:
-            datamanager: datamanager to render in the scene
-        """
-        # draw the new training cameras and images
-        image_indices = self._pick_drawn_image_idxs(len(datamanager.train_dataset))
-        camera_opt_to_camera = datamanager.train_camera_optimizer([0])
-        for idx in image_indices:
-            image = datamanager.train_dataset[idx]["image"]
-            bgr = image[..., [2, 1, 0]]
-            camera_json = datamanager.train_dataset.cameras.to_json(camera_idx=idx, image=bgr, max_size=100)
-            # camera_opt_param_group = datamanager.train_camera_optimizer
-            # camera_opt_params = datamanager.get_param_groups()[camera_opt_param_group][0].data
-            # # Apply learned transformation delta.
-            # if self.config.datamanager.camera_optimizer.mode == "off":
-            #     pass
-            # elif self.config.datamanager.camera_optimizer.mode == "SO3xR3":
-            #     camera_opt_transform_matrix = exp_map_SO3xR3(camera_opt_params)
-            # elif self.config.datamanager.camera_optimizer.mode == "SE3":
-            #     camera_opt_transform_matrix = exp_map_SE3(camera_opt_params)
-            #
-            # camera_to_world_tensor = torch.cat((torch.from_numpy(np.array(camera_json["camera_to_world"], dtype=np.float32)), \
-            #                                     torch.tensor([[0, 0, 0, 1]], dtype=torch.float32)), 0)
-            # camera_json["camera_to_world"] = (camera_opt_transform_matrix @ camera_to_world_tensor)[:3, :].tolist()
-            camera_to_world_tensor = torch.from_numpy(np.array(camera_json["camera_to_world"])).unsqueeze(0).to(device=camera_opt_to_camera.device, dtype=torch.float32)
-            camera_json["camera_to_world"] = pose_utils.multiply(camera_opt_to_camera, camera_to_world_tensor).squeeze().tolist()
-            # print(camera_json["camera_to_world"])
-            if pre_train:
-                # self.vis[f"sceneState/cameras/{idx:06d}_step_pre_train{step:06d}"].write(camera_json)
-                self.viser_server.add_dataset_image(idx=f"{idx:06d}_step_pre_{step:06d}", json=camera_json)
-
-            else:
-                # self.vis[f"sceneState/cameras/{idx:06d}_step_{step:06d}"].write(camera_json)
-                self.viser_server.add_dataset_image(idx=f"{idx:06d}_step__{step:06d}", json=camera_json)
-
 
     def update_scene(self, step: int, num_rays_per_batch: Optional[int] = None) -> None:
         """updates the scene based on the graph weights
