@@ -48,11 +48,6 @@ from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttrib
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import profiler
 
-from nerfstudio.cameras.lie_groups import exp_map_SE3, exp_map_SO3xR3
-from scipy.spatial.transform import Rotation
-import numpy as np
-import nerfstudio.utils.poses as pose_utils
-
 
 
 def module_wrapper(ddp_or_model: Union[DDP, Model]) -> Model:
@@ -216,10 +211,6 @@ class VanillaPipelineConfig(cfg.InstantiateConfig):
     """specifies the datamanager config"""
     model: ModelConfig = ModelConfig()
     """specifies the model config"""
-    registration: bool = False
-    """Registration mode is on."""
-    objaverse: bool = False
-    """objaverse mode is on."""
 
 class VanillaPipeline(Pipeline):
     """The pipeline class for the vanilla nerf setup of multiple cameras for one or a few scenes.
@@ -274,45 +265,6 @@ class VanillaPipeline(Pipeline):
         """Returns the device that the model is on."""
         return self.model.device
 
-    def rotation_distance(self, R1, R2, eps=1e-7):
-        """
-        Args:
-            R1: rotation matrix from camera 1 to world
-            R2: rotation matrix from camera 2 to world
-        Return:
-            angle: the angular distance between camera 1 and camera 2.
-        """
-        # http://www.boris-belousov.net/2016/12/01/quat-dist/
-        # R_diff = R1 @ R2.transpose(-2, -1)
-        # R_diff = R1.transpose(-2, -1) @ R2
-        R_diff = pose_utils.multiply(R1.transpose(-2, -1).to(torch.float64), R2.to(torch.float64))
-
-        trace = R_diff[..., 0, 0] + R_diff[..., 1, 1] + R_diff[..., 2, 2]
-
-        # numerical stability near -1/+1
-        angle = ((trace - 1) / 2).clamp(-1 + eps, 1 - eps).acos_()
-        angle = torch.rad2deg(angle)
-
-        return angle
-
-    @torch.no_grad()
-    def evaluate_camera_alignment(self, pred_poses, poses_gt):
-        """
-        Args:
-            pred_poses: [B, 3/4, 4]
-            poses_gt: [B, 3/4, 4]
-        """
-        # measure errors in rotation and translation
-        R_pred, t_pred = pred_poses.split([3, 1], dim=-1)
-        R_gt, t_gt = poses_gt.split([3, 1], dim=-1)
-
-        R_error = self.rotation_distance(R_pred[..., :3, :3], R_gt[..., :3, :3])
-        t_error = (t_pred[..., :3, -1] - t_gt[..., :3, -1])[..., 0].norm(dim=-1)
-        mean_rotation_error = R_error.mean()
-        mean_position_error = t_error.mean()
-
-        return mean_rotation_error, mean_position_error
-
     @profiler.time_function
     def get_train_loss_dict(self, step: int, full_images=False):
         """This function gets your training loss dict. This will be responsible for
@@ -330,71 +282,6 @@ class VanillaPipeline(Pipeline):
             ray_bundle, batch = self.datamanager.next_train(step)
             model_outputs = self.model(ray_bundle)
         metrics_dict = self.model.get_metrics_dict(model_outputs, batch, full_images)
-
-        if self.config.datamanager.camera_optimizer is not None:
-            # camera_opt_param_group = self.config.datamanager.camera_optimizer.param_group
-            # if camera_opt_param_group in self.datamanager.get_param_groups():
-            #     camera_opt_params = self.datamanager.get_param_groups()[camera_opt_param_group][0].data
-            #     # Report the camera optimization metrics
-            #     metrics_dict["camera_opt_translation"] = (
-            #         camera_opt_params[:, :3].norm()
-            #     )
-            #     metrics_dict["camera_opt_rotation"] = (
-            #         camera_opt_params[:, 3:].norm()
-            #     )
-            #
-            #     # Apply learned transformation delta.
-            #     if self.config.datamanager.camera_optimizer.mode == "off":
-            #         pass
-            #     elif self.config.datamanager.camera_optimizer.mode == "SO3xR3":
-            #         camera_opt_transform_matrix = exp_map_SO3xR3(camera_opt_params)
-            #     elif self.config.datamanager.camera_optimizer.mode == "SE3":
-            #         camera_opt_transform_matrix = exp_map_SE3(camera_opt_params)
-                # print("camera_opt_transform_matrix", camera_opt_transform_matrix)
-                # print("unregistration_matrix", unregistration_matrix)
-            if self.config.registration:
-                # camera_opt_transform_matrix = pose_utils.multiply(self.datamanager.train_camera_optimizer([0]),
-                #                                                   self.datamanager.train_camera_optimizer.t0)
-                camera_opt_transform_matrix = self.datamanager.train_camera_optimizer([0])
-                metrics_dict["t_final"] = camera_opt_transform_matrix
-                registration_matrix = torch.tensor(self.datamanager.train_dataparser_outputs.metadata["registration_matrix"], device=self.device)
-                if self.config.objaverse:
-                    # unreg_pose = self.datamanager.train_dataparser_outputs.cameras.camera_to_worlds.to(device=self.device)
-                    # unreg_pose = pose_utils.to4x4(unreg_pose)
-                    # reg_pose_pred = pose_utils.multiply(camera_opt_transform_matrix, unreg_pose)
-                    # reg_pose = pose_utils.multiply(registration_matrix, unreg_pose)
-                    # rotation_rmse, translation_rmse = self.evaluate_camera_alignment(reg_pose_pred, reg_pose)
-                    rotation_rmse, translation_rmse = self.evaluate_camera_alignment(camera_opt_transform_matrix, registration_matrix)
-                    translation_rmse_100 = translation_rmse * 100
-                else:
-                    # unregistration_matrix = self.datamanager.train_dataparser_outputs.metadata["unregistration_matrix"]
-                    # print(unregistration_matrix.shape)
-                    # print(camera_opt_transform_matrix.shape)
-                    # print(unregistration_matrix.to(self.device) @ torch.cat((camera_opt_transform_matrix.squeeze(), torch.tensor([[0, 0, 0, 1]], device=self.device)), dim=0))
-
-                    def npmat2euler(mat, seq='xyz'):
-                            eulers = []
-                            r = Rotation.from_matrix(mat.cpu().detach().numpy())
-                            eulers.append(r.as_euler(seq, degrees=True))
-                            return torch.tensor(np.array(eulers), dtype=torch.float32)
-
-                    camera_opt_rot_euler = npmat2euler(camera_opt_transform_matrix[:, :3, :3])
-                    registration_rot_euler = torch.tensor(self.datamanager.train_dataparser_outputs.metadata["registration_rot_euler"])
-                    camera_opt_translation = camera_opt_transform_matrix[:, :, 3].cpu()
-                    registration_translation = torch.tensor(self.datamanager.train_dataparser_outputs.metadata["registration_translation"])
-
-                    rotation_mse = torch.mean((camera_opt_rot_euler - registration_rot_euler).pow(2))
-                    translation_mse = torch.mean((camera_opt_translation - registration_translation).pow(2))
-
-                    rotation_rmse = torch.sqrt(rotation_mse)
-                    translation_rmse = torch.sqrt(translation_mse)
-                    translation_rmse_100 = translation_rmse * 100
-
-                # metrics_dict["rotation_mse"] = (rotation_mse)
-                metrics_dict["rotation_rmse"] = (rotation_rmse)
-                # metrics_dict["translation_mse"] = (translation_mse)
-                metrics_dict["translation_rmse_100"] = translation_rmse_100
-
 
         loss_dict = self.model.get_loss_dict(model_outputs, batch, metrics_dict, full_images)
 
@@ -442,49 +329,6 @@ class VanillaPipeline(Pipeline):
         return metrics_dict, images_dict
 
 
-    def get_average_train_image_metrics(self, step: Optional[int] = None):
-        """Iterate over all the images in the eval dataset and get the average.
-
-        Returns:
-            metrics_dict: dictionary of metrics
-        """
-        self.train()
-        metrics_dict_list = []
-        num_images = len(self.datamanager.fixed_indices_train_dataloader)
-        # with Progress(
-        #     TextColumn("[progress.description]{task.description}"),
-        #     BarColumn(),
-        #     TimeElapsedColumn(),
-        #     MofNCompleteColumn(),
-        #     transient=True,
-        # ) as progress:
-            # task = progress.add_task("[green]Evaluating all train images for registration...", total=num_images)
-
-        for camera_ray_bundle, batch in self.datamanager.fixed_indices_train_dataloader:
-            # time this the following line
-            inner_start = time()
-            height, width = camera_ray_bundle.shape
-            num_rays = height * width
-            outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
-            metrics_dict, _ = self.model.get_image_metrics_and_images(outputs, batch, step)
-            assert "num_rays_per_sec" not in metrics_dict
-            metrics_dict["num_rays_per_sec"] = num_rays / (time() - inner_start)
-            fps_str = "fps"
-            assert fps_str not in metrics_dict
-            metrics_dict[fps_str] = metrics_dict["num_rays_per_sec"] / (height * width)
-            metrics_dict_list.append(metrics_dict)
-            # progress.advance(task)
-        # average the metrics list
-        metrics_dict = {}
-        for key in metrics_dict_list[0].keys():
-            metrics_dict[key] = float(
-                torch.median(torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list]))
-            )
-            # if key == "loss":
-            #     print(metrics_dict_list[0][key])
-            #     print(metrics_dict_list[1][key])
-        self.train()
-        return metrics_dict
     @profiler.time_function
     def get_eval_image_metrics_and_images(self, step: int):
         """This function gets your evaluation loss dict. It needs to get the data

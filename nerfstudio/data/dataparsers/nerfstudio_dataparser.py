@@ -36,10 +36,6 @@ from nerfstudio.data.dataparsers.base_dataparser import (
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.utils.io import load_from_json
 
-import nerfstudio.utils.poses as pose_utils
-
-from scipy.spatial.transform import Rotation
-
 import imageio
 
 
@@ -71,24 +67,8 @@ class NerfstudioDataParserConfig(DataParserConfig):
     """The fraction of images to use for training. The remaining images are for eval."""
     depth_unit_scale_factor: float = 1e-3
     """Scales the depth values to meters. Default value is 0.001 for a millimeter to meter conversion."""
-    registration: bool = False
-    """Whether to apply registration transform."""
-    optimize_camera_registration: bool = False
-    """Whether to apply registration transform."""
-    scale_opt: bool = False
-    """Whether to optimize scale factor."""
-    load_registration: bool = False
-    """Whether to load registration data from json."""
-    max_angle_factor: float = 12
-    """Max Angle to rotate for registration test (for example - 4 -> pi/4)."""
-    max_translation: float = 0.2
-    """Max translation for registration test."""
     blender: bool = False
     """dataset from blender."""
-    registration_data: Path = None
-    """Directory or explicit json file path specifying location of registration data."""
-    inerf: bool = False
-    """load a aframe and transform it."""
     objaverse: bool = False
     """dataset from objaverse."""
     alpha_color: str = None
@@ -113,10 +93,6 @@ class Nerfstudio(DataParser):
         # import ipdb; ipdb.set_trace()
 
         assert self.config.data.exists(), f"Data directory {self.config.data} does not exist."
-        if self.config.registration_data is not None:
-            assert self.config.registration_data.exists(), f"Data directory {self.config.registration_data} does not exist."
-            registration_data = load_from_json(self.config.registration_data / f"dataparser_transforms.json")
-
 
         if self.config.data.suffix == ".json":
             meta = load_from_json(self.config.data)
@@ -308,76 +284,19 @@ class Nerfstudio(DataParser):
             poses = objaverse_transform_matrix @ poses
         else:
             objaverse_transform_matrix_json = None
-        if self.config.registration_data is not None:
-            transform_matrix = torch.tensor(registration_data["transform"])
-            poses = transform_matrix @ poses
-        elif self.config.load_registration:
-            transform_matrix = torch.tensor(meta["transform"])
-            # transform_matrix = torch.eye(4)
-        else:
-            poses, transform_matrix = camera_utils.auto_orient_and_center_poses(
-                poses,
-                method=orientation_method,
-                center_method=self.config.center_method,
-            )
+        poses, transform_matrix = camera_utils.auto_orient_and_center_poses(
+            poses,
+            method=orientation_method,
+            center_method=self.config.center_method,
+        )
 
         # Scale poses
         scale_factor = 1.0
         if self.config.auto_scale_poses:
             scale_factor /= float(torch.max(torch.abs(poses[:, :3, 3])))
-        elif self.config.registration_data is not None:
-            scale_factor = torch.tensor(registration_data["scale"])
         scale_factor *= self.config.scale_factor
-        # if self.config.load_registration:
-        #     scale_factor *= torch.tensor(meta["scale"])
-        if self.config.load_registration and not self.config.inerf:
-            scale_factor = 1.0
 
         poses[:, :3, 3] *= scale_factor
-
-
-        if self.config.registration:
-            if self.config.load_registration:
-                registration_matrix = torch.tensor(meta["registration_matrix"])
-                if meta["registration_rot_euler"] is not None:
-                    registration_rot_euler = torch.tensor(meta["registration_rot_euler"])
-                    registration_translation = torch.tensor(meta["registration_translation"])
-                else:
-                    registration_rot_euler = meta["registration_rot_euler"]
-                    registration_translation = meta["registration_translation"]
-            else:
-                max_angle_factor = self.config.max_angle_factor
-                max_translation = self.config.max_translation
-
-                anglex = np.random.uniform() * np.pi * max_angle_factor
-                angley = np.random.uniform() * np.pi * max_angle_factor
-                anglez = np.random.uniform() * np.pi * max_angle_factor
-
-
-                registration_rot_euler = torch.rad2deg(torch.tensor([anglex, angley, anglez]))
-                r = Rotation.from_euler('xyz', registration_rot_euler, degrees=True)
-                rotation_ab = r.as_matrix()
-
-                translation_ab = np.array([np.random.uniform(-max_translation, max_translation), np.random.uniform(-max_translation, max_translation),
-                                           np.random.uniform(-max_translation, max_translation)])
-
-                registration_matrix = np.zeros((4, 4), dtype=np.float32)
-                registration_matrix[:3, :3] = rotation_ab
-                registration_matrix[3, 3] = 1
-                registration_matrix[:3, -1] = translation_ab.T
-                registration_translation = torch.from_numpy(translation_ab)
-                CONSOLE.log(f"[yellow] registration_matrix is {registration_matrix}")
-                registration_matrix = torch.from_numpy(registration_matrix)
-
-                unregistration_matrix = pose_utils.inverse(registration_matrix)
-                poses = pose_utils.multiply(unregistration_matrix, poses)
-
-                CONSOLE.log(f"[yellow] rotation is {r}")
-                CONSOLE.log(f"[yellow] translation is {translation_ab}")
-
-            if self.config.inerf:
-                unregistration_matrix = pose_utils.inverse(registration_matrix)
-                poses = pose_utils.multiply(unregistration_matrix, poses)
 
         # Choose image_filenames and poses based on split, but after auto orient and scaling the poses.
         image_filenames = [image_filenames[i] for i in indices]
@@ -458,9 +377,6 @@ class Nerfstudio(DataParser):
             metadata={
                 "depth_filenames": depth_filenames if len(depth_filenames) > 0 else None,
                 "depth_unit_scale_factor": self.config.depth_unit_scale_factor,
-                "registration_matrix": registration_matrix if self.config.registration else None,
-                "registration_rot_euler": registration_rot_euler if self.config.registration else None,
-                "registration_translation": registration_translation if self.config.registration else None,
                 "objaverse_transform_matrix_json": objaverse_transform_matrix_json if self.config.objaverse else None,
                 "height": height,
                 "width": width,
