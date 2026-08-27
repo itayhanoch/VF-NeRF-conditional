@@ -131,6 +131,62 @@ This is a standalone script (not `ns-train`) meant to run on a Colab GPU for rea
 training runs -- see [`notebooks/train_conditional_nf_colab.ipynb`](notebooks/train_conditional_nf_colab.ipynb),
 which handles Drive-mounted checkpointing so training survives disconnects.
 
+## Training via the Colab CLI (alternative to the notebook)
+
+Instead of clicking through [`notebooks/train_conditional_nf_colab.ipynb`](notebooks/train_conditional_nf_colab.ipynb)
+in a browser, Google's official [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli)
+(shipped June 2026) drives a real Colab GPU runtime from your own terminal --
+no browser round-trips, and (unlike older `colab-ssh`/ngrok tunneling tricks,
+now against Colab's terms of service) it's Google's own sanctioned tool.
+
+```bash
+pip install google-colab-cli   # or: uv tool install google-colab-cli
+
+colab new --gpu T4              # provision a runtime (plain --gpu isn't documented
+                                 # as Pro-only; --high-mem explicitly requires Colab Pro/Pro+)
+colab console                   # drop into a raw shell on that VM
+```
+
+From the `colab console` shell, this is an ordinary terminal on the remote VM --
+run the same commands you would locally:
+
+```bash
+git clone https://github.com/itayhanoch/VF-NeRF-conditional.git
+cd VF-NeRF-conditional
+pip install torch==1.13.1 torchvision functorch --extra-index-url https://download.pytorch.org/whl/cu117
+pip install ninja "git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch"
+pip install -e . && pip install -e ./normalizing-flows
+
+ns-train nerfacto --data data/nerfstudio/poster
+python scripts/train_conditional_nf.py \
+    --nerf-config outputs/poster/nerfacto/TIMESTAMP/config.yml \
+    --scene-dir data/nerfstudio/poster \
+    --checkpoint-dir checkpoints/conditional_nf/poster
+```
+
+Useful CLI commands from your own terminal (outside `colab console`), run against
+the same session with `-s NAME` or the most recent one by default:
+- `colab drivemount` -- mount Google Drive, so checkpoints can land in the same
+  Drive path the notebook uses, for resuming across sessions (see "GPU budget" below).
+- `colab install -r requirements.txt` -- install deps via uv/pip without dropping into the console.
+- `colab upload`/`colab download` -- move files to/from the VM directly.
+- `colab status` / `colab sessions` -- check what's running and its hardware.
+- `colab stop` -- tear the session down when done.
+
+Auth is a one-time `--auth {oauth2,adc}` login (default `adc`), not per-command.
+
+### GPU budget: splitting nerfacto and conditional-NF training across sessions
+
+A free-tier T4 is meaningfully slower than the GPUs typical benchmarks are run
+on -- training the frozen nerfacto backbone for the default 30,000 iterations
+plus the one-time tiny-cuda-nn compile step can plausibly take 30-70+ minutes,
+which may not comfortably fit in a single free-tier session alongside the
+conditional-NF training too. Since both the notebook and `ns-train`'s own
+checkpointing land on Google Drive, the two steps don't need to happen in the
+same session:
+1. **Session 1**: `colab new --gpu T4` -> `colab drivemount` -> train nerfacto only, to a Drive-backed output dir.
+2. **Session 2** (later, fresh daily quota): `colab new --gpu T4` -> `colab drivemount` -> point `--nerf-config` at the checkpoint saved in session 1, and run only `scripts/train_conditional_nf.py` (much cheaper -- small MLPs, no tiny-cuda-nn, no hash grid).
+
 ## 5. Explore interactively
 
 ```bash
