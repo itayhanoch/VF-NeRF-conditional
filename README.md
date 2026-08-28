@@ -109,6 +109,15 @@ without your own capture:
 ````bash
 ns-download-data nerfstudio --capture-name=poster
 ````
+> **Google Drive throttling**: nerfstudio's example captures are hosted on Google
+> Drive, which frequently blocks scripted/automated downloads (`gdown`) with a
+> "cannot retrieve the public link" error -- confirmed against several of these
+> captures, not specific to `poster`. If `ns-download-data` fails this way, download
+> the zip manually from a normal logged-in browser instead (Drive's throttling
+> targets automated access, not interactive browser sessions) -- e.g. for `poster`:
+> https://drive.google.com/file/d/1FceQ5DX7bbTbHeL26t0x6ku56cwsRs6t/view --
+> then unzip it to `data/nerfstudio/poster/` yourself (on Colab: `colab upload`,
+> or place it in your own Drive and `colab drivemount`).
 
 ## 3. Train the frozen NeRF backbone
 
