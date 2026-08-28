@@ -11,9 +11,9 @@ directly to a (typically Drive-mounted) directory.
 
 Example:
     python scripts/train_conditional_nf.py \\
-        --nerf-config outputs/poster/nerfacto/TIMESTAMP/config.yml \\
-        --scene-dir data/poster \\
-        --checkpoint-dir checkpoints/conditional_nf/poster
+        --nerf-config outputs/bonsai/nerfacto/TIMESTAMP/config.yml \\
+        --scene-dir data/mipnerf360/bonsai \\
+        --checkpoint-dir checkpoints/conditional_nf/bonsai
 """
 import argparse
 import time

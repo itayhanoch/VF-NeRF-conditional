@@ -10,9 +10,9 @@ Run after downloading a frozen NeRF checkpoint (config.yml) and a trained
 conditional-NF checkpoint (.pt, from scripts/train_conditional_nf.py) locally:
 
     python app/gradio_app.py \\
-        --nerf-config outputs/poster/nerfacto/TIMESTAMP/config.yml \\
-        --cond-nf-checkpoint checkpoints/conditional_nf/poster/latest.pt \\
-        --scene-dir data/poster
+        --nerf-config outputs/bonsai/nerfacto/TIMESTAMP/config.yml \\
+        --cond-nf-checkpoint checkpoints/conditional_nf/bonsai/latest.pt \\
+        --scene-dir data/mipnerf360/bonsai
 """
 import argparse
 from pathlib import Path

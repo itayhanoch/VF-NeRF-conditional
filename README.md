@@ -104,20 +104,36 @@ Assuming you have a video or a set of images, run COLMAP to get a valid `transfo
 ````bash
 ns-process-data {video,images} --data {DATA_PATH} --output-dir {PROCESSED_DATA_DIR}
 ````
-Or use one of nerfstudio's bundled example scenes to try the pipeline end-to-end
-without your own capture:
+
+### Example scene: `bonsai` (recommended)
+
+To try the pipeline end-to-end without your own capture, this repo defaults to
+the `bonsai` scene from the [Mip-NeRF 360 dataset](https://jonbarron.info/mipnerf360/)
+-- a real, casually-captured, 360°, object-centric scene (a bonsai on a stand,
+on a small table), used here as a stand-in for VF-NeRF's own "table" scene,
+which was never publicly released. Unlike nerfstudio's own example captures
+(see below), it's hosted on Google Cloud Storage, not personal Google Drive, so
+it isn't subject to the same throttling/availability problems:
+````bash
+python scripts/downloads/download_mipnerf360.py --scene bonsai --save-dir data/mipnerf360
+````
+This only fetches `bonsai`'s own files (~1GB) out of the ~12.5GB archive that
+bundles all 9 Mip-NeRF 360 scenes together (via HTTP range requests), and
+converts its bundled COLMAP reconstruction straight to `transforms.json` --
+no local COLMAP run needed. Other indoor, bounded, object-centric scenes from
+the same release are available with `--scene {counter,kitchen,room}`.
+
+### Alternative: nerfstudio's own example scenes
+
 ````bash
 ns-download-data nerfstudio --capture-name=poster
 ````
 > **Google Drive throttling**: nerfstudio's example captures are hosted on Google
 > Drive, which frequently blocks scripted/automated downloads (`gdown`) with a
-> "cannot retrieve the public link" error -- confirmed against several of these
-> captures, not specific to `poster`. If `ns-download-data` fails this way, download
-> the zip manually from a normal logged-in browser instead (Drive's throttling
-> targets automated access, not interactive browser sessions) -- e.g. for `poster`:
-> https://drive.google.com/file/d/1FceQ5DX7bbTbHeL26t0x6ku56cwsRs6t/view --
-> then unzip it to `data/nerfstudio/poster/` yourself (on Colab: `colab upload`,
-> or place it in your own Drive and `colab drivemount`).
+> "cannot retrieve the public link" error -- confirmed against several captures.
+> At least one (`poster`) currently returns a plain 404 even from a normal
+> logged-in browser, meaning the file itself appears to have been removed, not
+> just throttled -- this is why `bonsai` is the recommended default above.
 
 ## 3. Train the frozen NeRF backbone
 
@@ -166,11 +182,12 @@ pip install torch==1.13.1 torchvision functorch --extra-index-url https://downlo
 pip install ninja "git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch"
 pip install -e . && pip install -e ./normalizing-flows
 
-ns-train nerfacto --data data/nerfstudio/poster
+python scripts/downloads/download_mipnerf360.py --scene bonsai --save-dir data/mipnerf360
+ns-train nerfacto --data data/mipnerf360/bonsai
 python scripts/train_conditional_nf.py \
-    --nerf-config outputs/poster/nerfacto/TIMESTAMP/config.yml \
-    --scene-dir data/nerfstudio/poster \
-    --checkpoint-dir checkpoints/conditional_nf/poster
+    --nerf-config outputs/bonsai/nerfacto/TIMESTAMP/config.yml \
+    --scene-dir data/mipnerf360/bonsai \
+    --checkpoint-dir checkpoints/conditional_nf/bonsai
 ```
 
 Useful CLI commands from your own terminal (outside `colab console`), run against

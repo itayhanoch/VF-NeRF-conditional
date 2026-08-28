@@ -19,6 +19,7 @@ dependencies = [
     "cryptography>=38",
     "tyro>=0.3.31",
     "gdown>=4.6.0",
+    "remotezip>=0.12.1",
     "ninja>=1.10",
     "functorch>=0.2.1",
     "h5py>=2.9.0",
