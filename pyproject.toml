@@ -74,9 +74,14 @@ gen = [
     "transformers==4.24.0",
 ]
 
-# Local interactive UI (app/gradio_app.py) -- not needed for training/Colab
+# Local interactive UI (app/gradio_app.py) -- not needed for training/Colab.
+# Gradio 3.x is unusable against a modern transitive stack (its bundled
+# fastapi/starlette/pydantic drift apart, and its frontend click/upload paths
+# break); 4.44.1 is the hotfix release that pins fastapi<0.113 and ships a
+# self-consistent web stack + frontend.
 ui = [
-    "gradio>=3.40,<4.0",
+    "gradio==4.44.1",
+    "numpy<2",
 ]
 
 

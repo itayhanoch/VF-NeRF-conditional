@@ -23,9 +23,8 @@ import numpy as np
 import torch
 
 from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.fields.nf_field import ConditionalNFField
-from nerfstudio.utils.dino_features import DinoExtractor, get_or_compute_cache, load_image_chw_01
+from nerfstudio.utils.dino_features import DinoExtractor, load_image_chw_01
 from nerfstudio.utils.eval_utils import eval_setup
 
 TOP_K_SHOWN = 20  # of the sampled candidates, how many (ranked) to show for selection
@@ -106,48 +105,84 @@ class InteractiveApp:
         self.device = torch.device(device)
 
         print(f"Loading frozen NeRF from {nerf_config} ...")
-        _, pipeline, _, _ = eval_setup(nerf_config, test_mode="inference")
+        config, pipeline, _, _ = eval_setup(nerf_config, test_mode="inference")
         self.nerf_model = pipeline.model.to(self.device)
         self.nerf_model.eval()
         for p in self.nerf_model.parameters():
             p.requires_grad_(False)
 
         print(f"Loading training cameras/images from {scene_dir} ...")
-        dataparser = NerfstudioDataParserConfig(data=scene_dir).setup()
-        outputs = dataparser.get_dataparser_outputs(split="train")
+        # Build the reference cameras in the SAME frame the frozen NeRF (and hence the
+        # conditional NF) was trained in -- the checkpoint's own dataparser config, not
+        # stock NerfstudioDataParserConfig defaults (center-method / scene-scale /
+        # downscale-factor differ, which would misplace both the cameras and the pixel
+        # coordinates the DINO patch grid is indexed by).
+        dataparser = config.pipeline.datamanager.dataparser
+        dataparser.data = scene_dir
+        outputs = dataparser.setup().get_dataparser_outputs(split="train")
         self.reference_cameras = outputs.cameras.to(self.device)
-        self.image_filenames = outputs.image_filenames
+        self.image_filenames = [Path(p) for p in outputs.image_filenames]
         self.backoff_distance = default_backoff_distance(self.reference_cameras)
         print(f"Default render backoff distance: {self.backoff_distance:.3f} (scene units)")
 
         print(f"Loading conditional-NF checkpoint from {cond_nf_checkpoint} ...")
         self.field, dino_model_name = load_conditional_nf(cond_nf_checkpoint, self.device)
 
-        self.dino_cache_dir = scene_dir / "dino_cache"
         self.extractor = DinoExtractor(model_name=dino_model_name, device=device)
+        self._grid_cache: dict = {}   # image path -> (patch grid [C,Hp,Wp] cpu, H, W)
 
     def image_choices(self) -> List[str]:
         return [str(p) for p in self.image_filenames]
 
     # --- condition extraction -------------------------------------------------
 
+    def _patch_grid(self, path: Path):
+        """[EMBED_DIM, Hp, Wp] DINOv2 patch-token grid for one image + its (H, W)."""
+        key = str(path)
+        if key not in self._grid_cache:
+            img = load_image_chw_01(path)
+            with torch.no_grad():
+                grid, (h, w) = self.extractor.extract_patch_grid(img)
+            self._grid_cache[key] = (grid.float().cpu(), int(h), int(w))
+        return self._grid_cache[key]
+
+    @staticmethod
+    def _pixel_to_patch_feature(grid: torch.Tensor, h: int, w: int, x: int, y: int) -> torch.Tensor:
+        """Pixel (x=col, y=row) -> the DINO feature of the patch cell it falls in.
+
+        Indexes the patch grid directly (same as the NF trainer's sample_batch); no
+        per-pixel upsampled map, and matches training-time condition semantics.
+        """
+        hp, wp = grid.shape[-2:]
+        px = min(max(int(x * wp / w), 0), wp - 1)
+        py = min(max(int(y * hp / h), 0), hp - 1)
+        return grid[:, py, px].reshape(-1).clone()
+
+    @staticmethod
+    def _click_xy(evt: gr.SelectData):
+        if evt is None or evt.index is None or evt.index[0] is None:
+            raise gr.Error("Click a point on the image first.")
+        return int(evt.index[0]), int(evt.index[1])  # (col, row) = (x, y)
+
     def training_image_condition(self, image_path_str: str, evt: gr.SelectData) -> torch.Tensor:
-        path = Path(image_path_str)
-        img = load_image_chw_01(path)
-        feat_map = get_or_compute_cache(img, path.stem, self.dino_cache_dir, self.extractor)
-        x, y = evt.index  # gr.SelectData on an Image gives (col, row) = (x, y)
-        return feat_map[:, y, x].clone()
+        x, y = self._click_xy(evt)
+        grid, h, w = self._patch_grid(Path(image_path_str))
+        return self._pixel_to_patch_feature(grid, h, w, x, y)
 
     def external_image_condition(self, pil_image, evt: gr.SelectData) -> torch.Tensor:
+        x, y = self._click_xy(evt)
         arr = np.asarray(pil_image.convert("RGB"), dtype=np.float32) / 255.0
         img = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-        x, y = evt.index
-        return self.extractor.extract_at_pixel(img, x, y)
+        with torch.no_grad():
+            grid, (h, w) = self.extractor.extract_patch_grid(img)
+        return self._pixel_to_patch_feature(grid.float().cpu(), int(h), int(w), x, y)
 
     # --- sample / rank / render -------------------------------------------------
 
     def sample_and_rank(self, condition: torch.Tensor, num_samples: int = 100, top_k: int = TOP_K_SHOWN):
-        condition = condition.to(self.device)
+        condition = condition.reshape(-1).to(self.device)
+        assert condition.numel() == self.field.context_dim, (
+            f"condition is {tuple(condition.shape)}, expected [{self.field.context_dim}]")
         with torch.no_grad():
             samples = self.field.sample(num_samples=num_samples, context=condition)
             cond_batch = condition.unsqueeze(0).expand(num_samples, -1)
@@ -161,13 +196,16 @@ class InteractiveApp:
             rows.append([i, *[round(v, 3) for v in pos], *[round(v, 3) for v in dirn], round(log_p[i].item(), 3)])
         return samples.cpu(), rows
 
-    def render_selected(self, samples: torch.Tensor, selected_labels: List[str]) -> List[np.ndarray]:
+    def render_selected(self, samples: torch.Tensor, selected_labels: List[str],
+                        render_downscale: float = 3.0) -> List[np.ndarray]:
         images = []
         for label in selected_labels:
             idx = int(label)
             pos = samples[idx, :3].to(self.device)
             dirn = samples[idx, 3:].to(self.device)
             camera = build_camera_from_point_direction(pos, dirn, self.reference_cameras, self.backoff_distance)
+            if render_downscale and render_downscale != 1.0:
+                camera.rescale_output_resolution(1.0 / render_downscale)
             ray_bundle = camera.generate_rays(camera_indices=0)
             with torch.no_grad():
                 out = self.nerf_model.get_outputs_for_camera_ray_bundle(ray_bundle)
@@ -176,7 +214,7 @@ class InteractiveApp:
         return images
 
 
-def build_ui(app: InteractiveApp) -> gr.Blocks:
+def build_ui(app: InteractiveApp, render_downscale_default: float = 3.0) -> gr.Blocks:
     columns = ["#", "x", "y", "z", "dx", "dy", "dz", "log_likelihood"]
 
     with gr.Blocks(title="Conditional-NF Novel View Explorer") as demo:
@@ -193,12 +231,14 @@ def build_ui(app: InteractiveApp) -> gr.Blocks:
 
             with gr.TabItem("External image"):
                 gr.Markdown("Upload any image and click a point -- only its DINO feature at that pixel is used; rendering still reuses the training scene's camera intrinsics.")
-                external_image = gr.Image(label="Click a point", type="pil")
+                external_image = gr.Image(label="Click a point", type="pil", sources=["upload"])
                 external_image.select(app.external_image_condition, inputs=external_image, outputs=condition_state)
 
         num_samples = gr.Slider(minimum=20, maximum=500, value=100, step=10, label="Samples to draw")
         sample_btn = gr.Button("Sample")
-        results_table = gr.Dataframe(headers=columns, label=f"Top {TOP_K_SHOWN} candidates, ranked by log-likelihood")
+        results_table = gr.Dataframe(
+            headers=columns, label=f"Top {TOP_K_SHOWN} candidates, ranked by log-likelihood",
+            interactive=False, col_count=(len(columns), "fixed"), datatype="number")
         selection = gr.CheckboxGroup(choices=[], label="Select 1-5 candidates to render (by #)")
 
         def do_sample(condition, n):
@@ -210,17 +250,19 @@ def build_ui(app: InteractiveApp) -> gr.Blocks:
 
         sample_btn.click(do_sample, inputs=[condition_state, num_samples], outputs=[samples_state, results_table, selection])
 
+        render_downscale = gr.Slider(minimum=1.0, maximum=6.0, value=render_downscale_default, step=0.5,
+                                     label="Render downscale (higher = faster, lower-res)")
         render_btn = gr.Button("Render selected")
-        gallery = gr.Gallery(label="Novel views", columns=5)
+        gallery = gr.Gallery(label="Novel views", columns=5, height="auto", object_fit="contain")
 
-        def do_render(samples, selected):
+        def do_render(samples, selected, downscale):
             if not selected:
                 raise gr.Error("Select at least one candidate.")
             if len(selected) > 5:
                 raise gr.Error("Select at most 5 candidates.")
-            return app.render_selected(samples, selected)
+            return app.render_selected(samples, selected, render_downscale=float(downscale))
 
-        render_btn.click(do_render, inputs=[samples_state, selection], outputs=gallery)
+        render_btn.click(do_render, inputs=[samples_state, selection, render_downscale], outputs=gallery)
 
     return demo
 
@@ -231,6 +273,8 @@ def parse_args():
     p.add_argument("--cond-nf-checkpoint", type=Path, required=True)
     p.add_argument("--scene-dir", type=Path, required=True)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--render-downscale", type=float, default=3.0,
+                   help="Downscale factor for the rendered novel views (higher = faster)")
     p.add_argument("--share", action="store_true")
     return p.parse_args()
 
@@ -238,8 +282,9 @@ def parse_args():
 def main():
     args = parse_args()
     app = InteractiveApp(args.nerf_config, args.cond_nf_checkpoint, args.scene_dir, args.device)
-    demo = build_ui(app)
-    demo.launch(share=args.share)
+    demo = build_ui(app, render_downscale_default=args.render_downscale)
+    demo.queue(default_concurrency_limit=1)
+    demo.launch(share=args.share, show_error=True)
 
 
 if __name__ == "__main__":
