@@ -16,7 +16,10 @@ DINOv2 feature at the clicked pixel is used -- the sampled novel views are still
 rendered as bonsai views through the frozen bonsai NeRF, so it is most useful
 when the external image shows similar content.
 
-    python app/pick_points.py                          # dataset frames (downloads bonsai ~1GB once)
+Deps: matplotlib, Pillow, and (only for the one-time bonsai download) remotezip
+-- NOT the full nerfstudio stack.
+
+    python app/pick_points.py                          # dataset frames (downloads bonsai images once)
     python app/pick_points.py --extra ~/photo.jpg      # dataset frames + one external image
     python app/pick_points.py --extra-only --extra a.jpg b.png   # only the external images
 
@@ -31,26 +34,57 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from PIL import Image
 
+# Mip-NeRF 360 archive (same source scripts/downloads/download_mipnerf360.py uses).
+ARCHIVE_URL = "http://storage.googleapis.com/gresearch/refraw360/360_v2.zip"
+
+
+def download_scene_images(scene_dir: Path, scene: str = "bonsai") -> None:
+    """Fetch just <scene>/images/* from the remote archive via HTTP range
+    requests into scene_dir/images/. No nerfstudio, no COLMAP conversion --
+    picking points only needs the pixels, not transforms.json."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        from remotezip import RemoteZip
+    except ImportError:
+        raise SystemExit("need `remotezip` for the download:  pip install remotezip")
+
+    images_dir = scene_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    print(f"downloading {scene}/images/ from {ARCHIVE_URL} (partial, HTTP range) ...")
+    with RemoteZip(ARCHIVE_URL) as z:
+        members = [n for n in z.namelist()
+                   if n.startswith(f"{scene}/images/") and not n.endswith("/")]
+    if not members:
+        raise SystemExit(f"no images for scene {scene!r} in the archive")
+
+    n_workers = 8
+    chunks = [members[i::n_workers] for i in range(n_workers)]
+
+    def grab(chunk):
+        with RemoteZip(ARCHIVE_URL) as z:
+            for m in chunk:
+                (images_dir / Path(m).name).write_bytes(z.read(m))
+        return len(chunk)
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        for got in ex.map(grab, [c for c in chunks if c]):
+            done += got
+            print(f"  {done}/{len(members)}")
+
 
 def ensure_scene(scene_dir: Path, downscale: int) -> list:
     """Make sure <scene_dir>/images_<downscale>/ exists, downloading + resizing
     as needed, and return the sorted list of its image paths."""
     scene_dir = scene_dir.expanduser().resolve()
-
-    if not (scene_dir / "transforms.json").exists():
-        # reuse the project's downloader (idempotent); import lazily so users who
-        # already have the data don't need a working nerfstudio install.
-        from scripts.downloads.download_mipnerf360 import download_scene
-
-        print(f"No scene at {scene_dir}; downloading bonsai (~1GB, one time) ...")
-        got = download_scene("bonsai", scene_dir.parent).resolve()
-        if got != scene_dir:
-            print(f"(using {got})")
-            scene_dir = got
-
     src = scene_dir / "images"
     dst = scene_dir / f"images_{downscale}"
-    src_imgs = sorted(src.glob("*"))
+
+    if not src.is_dir() or not any(src.iterdir()):
+        download_scene_images(scene_dir)
+
+    src_imgs = sorted(p for p in src.glob("*") if p.is_file())
     if not src_imgs:
         raise SystemExit(f"no images in {src}")
 
