@@ -6,10 +6,13 @@ images you pass). Click points on the objects you want to probe; the script
 prints a ready-to-paste `COORDS` block for the Kaggle notebook's cell 6a (and,
 equivalently, for `kaggle_explorer.py` / `app/gradio_app.py`).
 
-A `COORDS` entry is either:
-  * `[frame_int, x, y]`  -- a dataset frame, index into sorted(images_<downscale>/*)
-  * `["name.ext", x, y]` -- any other image; on Kaggle, attach a Dataset that
-    contains that file (it is looked up by name under /kaggle/input/**).
+Each `COORDS` entry is `["name.ext", x, y]` -- the image's basename:
+  * a bonsai frame  -> found in the notebook's images_<downscale>/ folder
+  * any other image -> on Kaggle, attach a Dataset containing that file (it is
+    looked up by name under /kaggle/input/**)
+Referencing frames by filename (not by position) keeps the picker and the
+notebook aligned. `[frame_int, x, y]` is still accepted by cell 6b for the old
+index form.
 
 Coordinates are in that image's own pixel space. For an external image only its
 DINOv2 feature at the clicked pixel is used -- the sampled novel views are still
@@ -108,31 +111,40 @@ def ensure_scene(scene_dir: Path, downscale: int) -> list:
 def build_items(args) -> list:
     """Ordered list of browsable images: dataset frames first, then --extra.
 
-    Each item is (ref, path): ref is an int (dataset frame index) or the
-    external image's basename (str)."""
-    items = []
+    Each item is (name, path, is_external). `name` (the file's basename) is what
+    goes into COORDS -- referencing frames by filename, not position, keeps the
+    picker and the Kaggle notebook aligned even if their image sets differ
+    slightly."""
+    items, seen = [], {}
     if not args.extra_only:
-        for i, p in enumerate(ensure_scene(args.scene_dir, args.downscale)):
-            items.append((i, p))
+        for p in ensure_scene(args.scene_dir, args.downscale):
+            items.append((p.name, p, False))
+            seen[p.name] = True
     for e in args.extra or []:
         p = Path(e).expanduser().resolve()
         if not p.is_file():
             raise SystemExit(f"--extra file not found: {p}")
-        items.append((p.name, p))
+        if p.name in seen:
+            raise SystemExit(f"--extra {p.name!r} clashes with a dataset frame name; rename it")
+        items.append((p.name, p, True))
+        seen[p.name] = True
     if not items:
         raise SystemExit("nothing to show (use --extra, or drop --extra-only)")
     return items
 
 
-def format_block(coords: list) -> str:
+def format_block(coords: list, items: list) -> str:
     if not coords:
         return "COORDS = []  # nothing picked"
+    ext = {name for name, _, is_ext in items if is_ext}
+    frame_no = {name: n for n, name in
+                enumerate(name for name, _, is_ext in items if not is_ext)}
     lines = ["COORDS = ["]
-    for ref, x, y in coords:
-        if isinstance(ref, int):
-            lines.append(f"    [{ref}, {x}, {y}],")
+    for name, x, y in coords:
+        if name in ext:
+            lines.append(f'    ["{name}", {x}, {y}],  # EXTERNAL - attach a Kaggle Dataset containing {name!r}')
         else:
-            lines.append(f'    ["{ref}", {x}, {y}],  # EXTERNAL - attach a Kaggle Dataset containing {ref!r}')
+            lines.append(f'    ["{name}", {x}, {y}],  # bonsai frame {frame_no.get(name, "?")}')
     lines.append("]")
     return "\n".join(lines)
 
@@ -161,12 +173,11 @@ def main():
         raise SystemExit("--extra-only needs --extra")
 
     items = build_items(args)
-    print(f"{len(items)} images "
-          f"({sum(isinstance(r, int) for r, _ in items)} dataset + "
-          f"{sum(not isinstance(r, int) for r, _ in items)} external)")
+    n_ext = sum(is_ext for _, _, is_ext in items)
+    print(f"{len(items)} images ({len(items) - n_ext} bonsai frames + {n_ext} external)")
 
     state = {"i": 0}
-    coords: list = []  # [ [ref, x, y], ... ]  ref = int frame index or str basename
+    coords: list = []  # [ [name, x, y], ... ]  name = the image's basename
 
     # free up keys we bind below from matplotlib's default toolbar shortcuts
     for _k in ("keymap.pan", "keymap.back", "keymap.forward"):
@@ -181,17 +192,17 @@ def main():
 
     def show():
         ax.clear()
-        ref, path = items[state["i"]]
+        name, path, is_ext = items[state["i"]]
         img = Image.open(path)
         ax.imshow(img)
         r = max(img.size) // 45
-        for k, (cref, x, y) in enumerate(coords):
-            if cref == ref:
+        for k, (cname, x, y) in enumerate(coords):
+            if cname == name:
                 ax.add_patch(Circle((x, y), radius=r, fill=False, color="red", lw=2))
                 ax.text(x + r, y - r, str(k), color="red", fontsize=13, weight="bold")
-        tag = f"frame {ref}" if isinstance(ref, int) else f"EXTERNAL {ref}"
+        kind = "EXTERNAL" if is_ext else "bonsai"
         ax.set_title(
-            f"[{state['i']}/{len(items) - 1}]  {tag}   points: {len(coords)}/{args.max_points}"
+            f"[{state['i']}/{len(items) - 1}]  {kind}  {name}   points: {len(coords)}/{args.max_points}"
             f"\nclick = add point   (buttons below, or keys n/p u r s q)"
         )
         ax.set_xlabel("x (px)")
@@ -213,9 +224,10 @@ def main():
         if len(coords) >= args.max_points:
             print(f"already at {args.max_points} points (undo / reset first)")
             return
-        ref = items[state["i"]][0]
-        coords.append([ref, int(round(x)), int(round(y))])
-        print(f"point {len(coords) - 1}: [{ref!r}, {int(round(x))}, {int(round(y))}]")
+        name = items[state["i"]][0]
+        xi, yi = int(round(x)), int(round(y))
+        coords.append([name, xi, yi])
+        print(f"point {len(coords) - 1}: [{name!r}, {xi}, {yi}]")
         show()
 
     def undo(*_):
@@ -229,7 +241,7 @@ def main():
         show()
 
     def dump(*_):
-        print("\n" + format_block(coords) + "\n")
+        print("\n" + format_block(coords, items) + "\n")
 
     def on_click(event):
         if event.inaxes is ax and event.xdata is not None and event.button == 1:
@@ -269,8 +281,8 @@ def main():
         if text.isdigit():
             goto(int(text))
             return
-        hit = next((k for k, (r, _) in enumerate(items)
-                    if isinstance(r, str) and text.lower() in r.lower()), None)
+        hit = next((k for k, (name, _, _) in enumerate(items)
+                    if text.lower() in name.lower()), None)
         if hit is None:
             print(f"no image matching {text!r}")
         else:
@@ -283,12 +295,13 @@ def main():
     show()
     plt.show()
 
-    block = format_block(coords)
+    block = format_block(coords, items)
     print("\n" + block + "\n")
-    ext = sorted({r for r, _, _ in coords if not isinstance(r, int)})
-    if ext:
+    ext_names = {name for name, _, is_ext in items if is_ext}
+    picked_ext = sorted({name for name, _, _ in coords if name in ext_names})
+    if picked_ext:
         print("external images picked -- put these in a Kaggle Dataset and attach it:")
-        for name in ext:
+        for name in picked_ext:
             print(f"  {name}")
     if args.out:
         args.out.write_text(block + "\n")
