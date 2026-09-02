@@ -82,6 +82,7 @@ gen = [
 ui = [
     "gradio==4.44.1",
     "huggingface_hub==0.25.2",  # 4.44.1's oauth.py imports HfFolder, removed in hub >=1.0
+    "pydantic==2.9.2",          # 2.10 breaks gradio_client's get_api_info() -> every page 500s
     "numpy<2",
 ]
 
