@@ -47,9 +47,17 @@ from nerfstudio.utils.decorators import (
 )
 from nerfstudio.utils.misc import step_check
 from nerfstudio.utils.writer import EventName, TimeWriter
-from nerfstudio.viewer.server import viewer_utils
 from tqdm import tqdm
-from nerfstudio.viewer.server.viewer_state import ViewerState
+
+# The viser-backed viewer is imported lazily: nerfstudio 0.2.1 vendors an old viser
+# API but a modern viser gets installed as the dependency, and it clashes with the
+# websockets bound gradio pins. viewer_utils is unused in this module; ViewerState is
+# only touched under is_viewer_enabled(), which eval/inference never sets.
+try:
+    from nerfstudio.viewer.server import viewer_utils
+    from nerfstudio.viewer.server.viewer_state import ViewerState
+except Exception:  # pragma: no cover - viewer optional
+    viewer_utils = ViewerState = None
 
 CONSOLE = Console(width=120)
 

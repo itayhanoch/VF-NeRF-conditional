@@ -21,6 +21,7 @@ from typing import List, Tuple
 import gradio as gr
 import numpy as np
 import torch
+from PIL import Image, ImageDraw
 
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.fields.nf_field import ConditionalNFField
@@ -81,6 +82,20 @@ def build_camera_from_point_direction(
         height=reference_cameras.height[0:1],
         camera_type=reference_cameras.camera_type[0:1],
     ).to(device)
+
+
+def mark_point(pil_img: Image.Image, x: int, y: int) -> np.ndarray:
+    """Return `pil_img` as an RGB uint8 array with a circle + crosshair drawn at (x, y)
+    -- the pixel whose DINO feature was used as the flow's condition."""
+    im = pil_img.convert("RGB").copy()
+    r = max(10, min(im.size) // 40)
+    w = max(2, r // 4)
+    d = ImageDraw.Draw(im)
+    d.ellipse([x - r, y - r, x + r, y + r], outline=(255, 40, 40), width=w)
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        d.line([x + dx * (r // 3), y + dy * (r // 3), x + dx * (r + w), y + dy * (r + w)],
+               fill=(255, 40, 40), width=w)
+    return np.asarray(im)
 
 
 def load_conditional_nf(checkpoint_path: Path, device: torch.device) -> Tuple[ConditionalNFField, str]:
@@ -164,18 +179,20 @@ class InteractiveApp:
             raise gr.Error("Click a point on the image first.")
         return int(evt.index[0]), int(evt.index[1])  # (col, row) = (x, y)
 
-    def training_image_condition(self, image_path_str: str, evt: gr.SelectData) -> torch.Tensor:
+    def training_image_condition(self, image_path_str: str, evt: gr.SelectData):
         x, y = self._click_xy(evt)
         grid, h, w = self._patch_grid(Path(image_path_str))
-        return self._pixel_to_patch_feature(grid, h, w, x, y)
+        cond = self._pixel_to_patch_feature(grid, h, w, x, y)
+        return cond, mark_point(Image.open(image_path_str), x, y)
 
-    def external_image_condition(self, pil_image, evt: gr.SelectData) -> torch.Tensor:
+    def external_image_condition(self, pil_image, evt: gr.SelectData):
         x, y = self._click_xy(evt)
         arr = np.asarray(pil_image.convert("RGB"), dtype=np.float32) / 255.0
         img = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
         with torch.no_grad():
             grid, (h, w) = self.extractor.extract_patch_grid(img)
-        return self._pixel_to_patch_feature(grid.float().cpu(), int(h), int(w), x, y)
+        cond = self._pixel_to_patch_feature(grid.float().cpu(), int(h), int(w), x, y)
+        return cond, mark_point(pil_image, x, y)
 
     # --- sample / rank / render -------------------------------------------------
 
@@ -227,12 +244,16 @@ def build_ui(app: InteractiveApp, render_downscale_default: float = 3.0) -> gr.B
                 image_dropdown = gr.Dropdown(choices=app.image_choices(), label="Training image")
                 train_image = gr.Image(label="Click a point", type="filepath", interactive=False)
                 image_dropdown.change(lambda p: p, inputs=image_dropdown, outputs=train_image)
-                train_image.select(app.training_image_condition, inputs=image_dropdown, outputs=condition_state)
 
             with gr.TabItem("External image"):
                 gr.Markdown("Upload any image and click a point -- only its DINO feature at that pixel is used; rendering still reuses the training scene's camera intrinsics.")
                 external_image = gr.Image(label="Click a point", type="pil", sources=["upload"])
-                external_image.select(app.external_image_condition, inputs=external_image, outputs=condition_state)
+
+        selected_point = gr.Image(label="Selected point (source of the DINO condition)", interactive=False)
+        train_image.select(app.training_image_condition, inputs=image_dropdown,
+                           outputs=[condition_state, selected_point])
+        external_image.select(app.external_image_condition, inputs=external_image,
+                              outputs=[condition_state, selected_point])
 
         num_samples = gr.Slider(minimum=20, maximum=500, value=100, step=10, label="Samples to draw")
         sample_btn = gr.Button("Sample")
