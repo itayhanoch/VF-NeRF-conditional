@@ -23,8 +23,10 @@ Deps: matplotlib, Pillow, and (only for the one-time bonsai download) remotezip
     python app/pick_points.py --extra ~/photo.jpg      # dataset frames + one external image
     python app/pick_points.py --extra-only --extra a.jpg b.png   # only the external images
 
-Controls: click = add point | n / -> next image | p / <- prev image
-          u = undo last point | r = reset all | s = print block | q = quit
+Controls: click on the image = add a point. Buttons along the bottom
+(Prev / Next / Undo / Reset / Print / Done) and a "go to" box to jump to an
+index or an --extra filename. Keys also work: n/p or arrows = change image,
+u = undo, r = reset, s = print, q = quit.
 """
 import argparse
 from pathlib import Path
@@ -32,6 +34,7 @@ from pathlib import Path
 import matplotlib  # native backend on purpose; there's an 'agg' guard in main()
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
+from matplotlib.widgets import Button, TextBox
 from PIL import Image
 
 # Mip-NeRF 360 archive (same source scripts/downloads/download_mipnerf360.py uses).
@@ -165,7 +168,12 @@ def main():
     state = {"i": 0}
     coords: list = []  # [ [ref, x, y], ... ]  ref = int frame index or str basename
 
+    # free up keys we bind below from matplotlib's default toolbar shortcuts
+    for _k in ("keymap.pan", "keymap.back", "keymap.forward"):
+        plt.rcParams[_k] = []
+
     fig, ax = plt.subplots(figsize=(13, 9))
+    fig.subplots_adjust(bottom=0.16)
     try:
         fig.canvas.manager.set_window_title("VF-NeRF point picker")
     except Exception:
@@ -183,47 +191,95 @@ def main():
                 ax.text(x + r, y - r, str(k), color="red", fontsize=13, weight="bold")
         tag = f"frame {ref}" if isinstance(ref, int) else f"EXTERNAL {ref}"
         ax.set_title(
-            f"[{state['i']}/{len(items) - 1}]  {tag}   "
-            f"points: {len(coords)}/{args.max_points}   "
-            f"[click add | n/p image | u undo | r reset | s print | q quit]"
+            f"[{state['i']}/{len(items) - 1}]  {tag}   points: {len(coords)}/{args.max_points}"
+            f"\nclick = add point   (buttons below, or keys n/p u r s q)"
         )
         ax.set_xlabel("x (px)")
         ax.set_ylabel("y (px)")
         fig.canvas.draw_idle()
 
-    def on_click(event):
-        if event.inaxes is not ax or event.xdata is None or event.button != 1:
-            return
+    def step(d):
+        state["i"] = (state["i"] + d) % len(items)
+        show()
+
+    def goto(i):
+        if 0 <= i < len(items):
+            state["i"] = i
+            show()
+        else:
+            print(f"index {i} out of range 0..{len(items) - 1}")
+
+    def add_point(x, y):
         if len(coords) >= args.max_points:
-            print(f"already at {args.max_points} points (u = undo, r = reset)")
+            print(f"already at {args.max_points} points (undo / reset first)")
             return
         ref = items[state["i"]][0]
-        x, y = int(round(event.xdata)), int(round(event.ydata))
-        coords.append([ref, x, y])
-        print(f"point {len(coords) - 1}: [{ref!r}, {x}, {y}]")
+        coords.append([ref, int(round(x)), int(round(y))])
+        print(f"point {len(coords) - 1}: [{ref!r}, {int(round(x))}, {int(round(y))}]")
         show()
+
+    def undo(*_):
+        if coords:
+            print("undo", coords.pop())
+            show()
+
+    def reset(*_):
+        coords.clear()
+        print("reset")
+        show()
+
+    def dump(*_):
+        print("\n" + format_block(coords) + "\n")
+
+    def on_click(event):
+        if event.inaxes is ax and event.xdata is not None and event.button == 1:
+            add_point(event.xdata, event.ydata)
 
     def on_key(event):
         if event.key in ("n", "right"):
-            state["i"] = (state["i"] + 1) % len(items)
-            show()
+            step(1)
         elif event.key in ("p", "left"):
-            state["i"] = (state["i"] - 1) % len(items)
-            show()
-        elif event.key == "u" and coords:
-            print("undo", coords.pop())
-            show()
+            step(-1)
+        elif event.key == "u":
+            undo()
         elif event.key == "r":
-            coords.clear()
-            print("reset")
-            show()
+            reset()
         elif event.key == "s":
-            print("\n" + format_block(coords) + "\n")
+            dump()
         elif event.key in ("q", "escape"):
             plt.close(fig)
 
     fig.canvas.mpl_connect("button_press_event", on_click)
     fig.canvas.mpl_connect("key_press_event", on_key)
+
+    # on-screen controls (kept referenced so callbacks stay alive)
+    widgets = []
+    specs = [("< Prev", lambda e: step(-1)), ("Next >", lambda e: step(1)),
+             ("Undo", undo), ("Reset", reset), ("Print", dump),
+             ("Done", lambda e: plt.close(fig))]
+    for j, (label, cb) in enumerate(specs):
+        b = Button(fig.add_axes([0.04 + j * 0.11, 0.04, 0.10, 0.055]), label)
+        b.on_clicked(cb)
+        widgets.append(b)
+
+    def on_goto(text):
+        text = text.strip()
+        if not text:
+            return
+        if text.isdigit():
+            goto(int(text))
+            return
+        hit = next((k for k, (r, _) in enumerate(items)
+                    if isinstance(r, str) and text.lower() in r.lower()), None)
+        if hit is None:
+            print(f"no image matching {text!r}")
+        else:
+            goto(hit)
+
+    tb = TextBox(fig.add_axes([0.78, 0.04, 0.12, 0.055]), "go to ")
+    tb.on_submit(on_goto)
+    widgets.append(tb)
+
     show()
     plt.show()
 
