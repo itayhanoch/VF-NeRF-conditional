@@ -155,7 +155,8 @@ def main():
     )
     ap.add_argument("--scene-dir", type=Path, default=Path("data/mipnerf360/bonsai"))
     ap.add_argument("--downscale", type=int, default=2)
-    ap.add_argument("--max-points", type=int, default=5)
+    ap.add_argument("--max-points", type=int, default=20,
+                    help="safety cap on how many points you can drop in one session")
     ap.add_argument("--extra", nargs="+", metavar="IMG",
                     help="local image file(s) to pick on in addition to the dataset frames")
     ap.add_argument("--extra-only", action="store_true",
