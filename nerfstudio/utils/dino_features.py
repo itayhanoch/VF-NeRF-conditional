@@ -8,12 +8,13 @@ Resizing strategy deliberately differs from that repo: rather than forcing every
 image through a fixed 518x518 (squashing aspect ratio and, for any image far from
 518px, a large downsample-then-blur-upsample round trip that coarsens spatial
 precision), this module reflection-pads each image up to the nearest multiple of
-14 in each dimension and runs DINOv2 at that near-native resolution. DINOv2
-supports arbitrary patch-divisible input sizes via interpolated position
-embeddings -- the toy repo's fixed-518 choice was a simplicity shortcut for its
-own visualization script, not a hard model constraint. This matters here because
-the extracted feature at a pixel needs to correspond as precisely as possible to
-that pixel's own NeRF ray, not a blurred neighborhood of it.
+14 in each dimension and runs DINOv2 at that near-native resolution (down to a
+`MAX_DINO_SIDE` ceiling -- see below). DINOv2 supports arbitrary patch-divisible
+input sizes via interpolated position embeddings -- the toy repo's fixed-518
+choice was a simplicity shortcut for its own visualization script, not a hard
+model constraint. This matters here because the extracted feature at a pixel
+needs to correspond as precisely as possible to that pixel's own NeRF ray, not a
+blurred neighborhood of it.
 """
 from __future__ import annotations
 
@@ -28,6 +29,14 @@ HUB_REPO = "facebookresearch/dinov2"
 HUB_ENTRYPOINT = "dinov2_vits14"
 PATCH_SIZE = 14
 EMBED_DIM = 384
+# Ceiling on the DINOv2 forward-pass long side (112 * 14). torch < 2.0 has no
+# flash-attention, so the attention fallback materialises the full [1, heads, N, N]
+# patch-vs-patch matrix; at native `images_2` this is manageable (bonsai ~1559 px
+# -> ~8.4k patches -> ~3-4 GB) but a much larger frame OOMs. An image whose long
+# side is <= this runs at native resolution, so its patch tokens exactly match the
+# un-rescaled image; a larger one is bilinearly downscaled for the forward pass
+# only (raise this, or use a higher downscale factor, to get those native too).
+MAX_DINO_SIDE = 1568
 # DINOv2's own ImageNet-pretraining normalization (dinov2/data/transforms.py).
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -74,28 +83,38 @@ class DinoExtractor:
             p.requires_grad_(False)
 
     def extract_patch_grid(self, image_chw_01: torch.Tensor):
-        """[3,H,W] float in [0,1] -> ([EMBED_DIM, H'/14, W'/14] patch-token grid, (h, w)).
+        """[3,H,W] float in [0,1] -> ([EMBED_DIM, Hp, Wp] patch-token grid, (h, w)).
 
-        (h, w) is the image's original (pre-padding) shape, needed by
-        upsample_to_pixels/extract_pixel_map to crop the padding back off.
-        Uses model.get_intermediate_layers(x, n=1, reshape=True, return_class_token=False)
+        (h, w) is the image's ORIGINAL pixel shape (before any MAX_DINO_SIDE
+        downscale or patch-multiple padding); callers map a pixel to its patch
+        cell with `Hp/h`, `Wp/w`. Uses
+        model.get_intermediate_layers(x, n=1, reshape=True, return_class_token=False)
         -- the hub model's documented way to get the last block's normalized patch
         tokens pre-reshaped to a spatial grid.
         """
-        padded, (h, w) = _pad_to_patch_multiple(image_chw_01.to(self.device))
+        img = image_chw_01.to(self.device)
+        h, w = int(img.shape[-2]), int(img.shape[-1])
+        if max(h, w) > MAX_DINO_SIDE:
+            # downscale for the forward pass only; the returned (h, w) stays native
+            scale = MAX_DINO_SIDE / max(h, w)
+            img = F.interpolate(
+                img.unsqueeze(0), scale_factor=scale, mode="bilinear",
+                align_corners=False, recompute_scale_factor=False,
+            ).squeeze(0)
+        padded, _ = _pad_to_patch_multiple(img)
         normalized = _normalize_for_dinov2(padded)
         with torch.no_grad():
             (patch_tokens,) = self.model.get_intermediate_layers(normalized.unsqueeze(0), n=1, reshape=True, return_class_token=False)
         return patch_tokens.squeeze(0), (h, w)  # [EMBED_DIM, Hp, Wp], (h, w)
 
     def upsample_to_pixels(self, patch_grid: torch.Tensor, h: int, w: int) -> torch.Tensor:
-        """[C,Hp,Wp] -> [C,h,w]: bilinear-upsample to the padded resolution
-        (Hp*14, Wp*14), then crop to the original (h, w) (removes the
-        reflection-padded margin, which is <14px and only on the right/bottom)."""
-        hp, wp = patch_grid.shape[-2:]
-        padded_h, padded_w = hp * PATCH_SIZE, wp * PATCH_SIZE
-        upsampled = F.interpolate(patch_grid.unsqueeze(0), size=(padded_h, padded_w), mode="bilinear", align_corners=False).squeeze(0)
-        return upsampled[:, :h, :w]
+        """[C,Hp,Wp] -> [C,h,w]: bilinear-upsample the patch grid straight to the
+        original pixel size. (Interpolating to (h, w) directly, rather than to
+        Hp*14 x Wp*14 then cropping, also covers the case where the grid came from
+        a MAX_DINO_SIDE-downscaled forward pass, i.e. Hp*14 < h.)"""
+        return F.interpolate(
+            patch_grid.unsqueeze(0), size=(int(h), int(w)), mode="bilinear", align_corners=False
+        ).squeeze(0)
 
     def extract_pixel_map(self, image_chw_01: torch.Tensor) -> torch.Tensor:
         """[3,H,W] float in [0,1] -> [EMBED_DIM,H,W] full-resolution per-pixel feature map,

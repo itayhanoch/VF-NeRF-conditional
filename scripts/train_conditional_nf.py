@@ -6,8 +6,15 @@ using a FROZEN, already-trained nerfacto checkpoint purely for inference (never
 fine-tuned here) to get each sampled ray's surface point via its depth render.
 
 Deliberately bypasses nerfstudio's Trainer/Pipeline/DataManager entirely -- this is
-a plain PyTorch training loop meant to run on a single Colab GPU, checkpointing
-directly to a (typically Drive-mounted) directory.
+a plain PyTorch training loop meant to run on a single Colab/Kaggle GPU,
+checkpointing directly to a (typically mounted) directory.
+
+DINO features are precomputed once, at each image's native resolution (capped at
+`dino_features.MAX_DINO_SIDE`), into ONE memory-mapped `.npy` on disk -- only the
+per-batch sampled slice is ever resident. Each training step samples a continuous
+sub-pixel (not a patch centre), so the frozen NeRF's depth renders give 3-D
+targets that densely cover the surfaces; the condition is the DINOv2 token of the
+14x14 patch that pixel falls in (nearest cell, matching the interactive explorer).
 
 Example:
     python scripts/train_conditional_nf.py \\
@@ -19,13 +26,14 @@ import argparse
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.optim import RAdam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.fields.nf_field import ConditionalNFField
-from nerfstudio.utils.dino_features import DinoExtractor, get_or_compute_cache, load_image_chw_01
+from nerfstudio.utils.dino_features import DinoExtractor, load_image_chw_01
 from nerfstudio.utils.eval_utils import eval_setup
 
 
@@ -41,7 +49,7 @@ def parse_args():
     p.add_argument("--cond-prior", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--use-batchnorm", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--batch-size", type=int, default=4096)
-    p.add_argument("--max-steps", type=int, default=20000)
+    p.add_argument("--max-steps", type=int, default=30000)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--grad-clip-norm", type=float, default=5000.0)
     p.add_argument("--checkpoint-every", type=int, default=500)
@@ -50,46 +58,87 @@ def parse_args():
     return p.parse_args()
 
 
-def build_training_cameras(scene_dir: Path):
-    dataparser = NerfstudioDataParserConfig(data=scene_dir).setup()
-    outputs = dataparser.get_dataparser_outputs(split="train")
+def build_training_cameras(scene_dir: Path, dataparser_config=None):
+    """Cameras + image paths in the frozen NeRF's own dataparser frame.
+
+    Pass the checkpoint's dataparser config so center-method / scene-scale /
+    downscale-factor match what the NeRF (and hence these targets) were trained
+    in; falls back to stock defaults when not given.
+    """
+    if dataparser_config is None:
+        dataparser_config = NerfstudioDataParserConfig()
+    dataparser_config.data = Path(scene_dir)
+    outputs = dataparser_config.setup().get_dataparser_outputs(split="train")
     return outputs.cameras, outputs.image_filenames
 
 
 def precompute_dino_cache(image_filenames, cache_dir: Path, extractor: DinoExtractor):
-    """Returns a list of [EMBED_DIM,H,W] feature-map tensors, aligned with image_filenames."""
-    caches = []
-    for i, path in enumerate(image_filenames):
-        img = load_image_chw_01(path)
-        feat = get_or_compute_cache(img, path.stem, cache_dir, extractor)
-        caches.append(feat)
-        if (i + 1) % 20 == 0 or (i + 1) == len(image_filenames):
-            print(f"  DINO cache: {i + 1}/{len(image_filenames)}")
-    return caches
+    """Native-resolution DINOv2 patch grids for every training image, kept in ONE
+    memory-mapped .npy on disk (only the per-batch sampled slice is resident).
+
+    Layout [N, Hp, Wp, EMBED_DIM] fp16 -- the last-axis-contiguous form makes
+    sample_batch's gather a plain 3-array advanced index. Returns
+    (grids_mmap, H, W) where (H, W) is the shared pixel size of the images.
+    Recompute is skipped when a cache with the matching shape already exists.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    n = len(image_filenames)
+
+    img0 = load_image_chw_01(image_filenames[0])
+    h, w = int(img0.shape[-2]), int(img0.shape[-1])
+    with torch.no_grad():
+        grid0, _ = extractor.extract_patch_grid(img0)  # [C, Hp, Wp]
+    c, hp, wp = (int(v) for v in grid0.shape)
+
+    npy = cache_dir / f"dino_grids_{extractor.model_name}_{h}x{w}_{hp}x{wp}.npy"
+    if npy.exists():
+        mm = np.load(npy, mmap_mode="r")
+        if mm.shape == (n, hp, wp, c):
+            print(f"  reusing DINO cache {npy.name} {mm.shape}")
+            return mm, h, w
+        print(f"  DINO cache {npy.name} is {mm.shape}, want {(n, hp, wp, c)} -- recomputing")
+        del mm
+
+    mm = np.lib.format.open_memmap(npy, mode="w+", dtype=np.float16, shape=(n, hp, wp, c))
+    mm[0] = grid0.permute(1, 2, 0).to(torch.float16).cpu().numpy()
+    for i in range(1, n):
+        img = load_image_chw_01(image_filenames[i])
+        assert tuple(img.shape[-2:]) == (h, w), (
+            f"{image_filenames[i].name} is {tuple(img.shape[-2:])}, expected {(h, w)} -- "
+            "all training images must share a resolution for the mem-mapped cache")
+        with torch.no_grad():
+            grid, _ = extractor.extract_patch_grid(img)
+        mm[i] = grid.permute(1, 2, 0).to(torch.float16).cpu().numpy()
+        if (i + 1) % 20 == 0 or (i + 1) == n:
+            print(f"  DINO cache: {i + 1}/{n}")
+    mm.flush()
+    del mm
+    return np.load(npy, mmap_mode="r"), h, w
 
 
 def sample_batch(cameras, dino_caches, batch_size, device):
-    """Random (image, pixel) triples -> (RayBundle, condition[B,C]) on `device`."""
-    num_images = len(dino_caches)
-    img_idx = torch.randint(0, num_images, (batch_size,))
-    ys = torch.empty(batch_size, dtype=torch.long)
-    xs = torch.empty(batch_size, dtype=torch.long)
-    embed_dim = dino_caches[0].shape[0]
-    conditions = torch.empty(batch_size, embed_dim)
+    """Random (image, sub-pixel) -> (RayBundle, condition[B, C]) on `device`.
 
-    for i in range(num_images):
-        mask = img_idx == i
-        n = int(mask.sum())
-        if n == 0:
-            continue
-        h, w = dino_caches[i].shape[-2:]
-        y = torch.randint(0, h, (n,))
-        x = torch.randint(0, w, (n,))
-        ys[mask] = y
-        xs[mask] = x
-        conditions[mask] = dino_caches[i][:, y, x].permute(1, 0).cpu()
+    Pixels are drawn continuously over each image, not snapped to patch centres,
+    so the frozen NeRF's depth renders give 3-D targets that densely cover the
+    surfaces. The condition is the DINOv2 token of the 14x14 patch that pixel
+    falls in -- the same nearest-cell lookup kaggle_explorer.py / gradio_app.py
+    use at inference.
+    """
+    grids, h, w = dino_caches  # grids: np.memmap [N, Hp, Wp, C] fp16
+    n, hp, wp, _ = grids.shape
 
-    coords = torch.stack([ys.float() + 0.5, xs.float() + 0.5], dim=-1)  # (y, x), matches Cameras.generate_rays' convention
+    img_idx = torch.randint(0, n, (batch_size,))
+    ys = torch.rand(batch_size) * h
+    xs = torch.rand(batch_size) * w
+    py = (ys * (hp / h)).long().clamp_(0, hp - 1)
+    px = (xs * (wp / w)).long().clamp_(0, wp - 1)
+
+    cond_np = grids[img_idx.numpy(), py.numpy(), px.numpy()].astype(np.float32)  # [B, C]
+    conditions = torch.from_numpy(cond_np)
+
+    coords = torch.stack([ys, xs], dim=-1)  # (y, x) fractional pixel, matches Cameras.generate_rays
     camera_indices = img_idx.unsqueeze(-1)
     ray_bundle = cameras.generate_rays(camera_indices=camera_indices, coords=coords)
     return ray_bundle.to(device), conditions.to(device)
@@ -101,14 +150,22 @@ def main():
     torch.manual_seed(args.seed)
 
     print(f"Loading frozen NeRF from {args.nerf_config} ...")
-    _, pipeline, _, _ = eval_setup(args.nerf_config, test_mode="inference")
+    config, pipeline, _, _ = eval_setup(args.nerf_config, test_mode="inference")
     nerf_model = pipeline.model.to(device)
     nerf_model.eval()
     for param in nerf_model.parameters():
         param.requires_grad_(False)
 
+    # The DINO precompute peaks GPU memory (no flash-attention on torch < 2.0);
+    # park the frozen NeRF on the CPU while it runs, then bring it back for the
+    # training loop.
+    nerf_model = nerf_model.cpu()
+    torch.cuda.empty_cache()
+
     print(f"Loading training cameras/images from {args.scene_dir} ...")
-    cameras, image_filenames = build_training_cameras(args.scene_dir)
+    cameras, image_filenames = build_training_cameras(
+        args.scene_dir, config.pipeline.datamanager.dataparser
+    )
     cameras = cameras.to(device)
 
     dino_cache_dir = args.dino_cache_dir or (args.scene_dir / "dino_cache")
@@ -117,6 +174,10 @@ def main():
     dino_caches = precompute_dino_cache(image_filenames, dino_cache_dir, extractor)
 
     context_dim = extractor.embed_dim
+    del extractor
+    torch.cuda.empty_cache()
+    nerf_model = nerf_model.to(device)
+
     field = ConditionalNFField(
         context_dim=context_dim,
         num_blocks=args.num_blocks,
