@@ -7,8 +7,9 @@ in this repo): `pytest tests/`, e.g. whenever condflow.py/nf_field.py changes, o
 before committing to a real Colab training run.
 """
 import torch
+from torch import nn
 
-from nerfstudio.fields.nf_field import ConditionalNFField
+from nerfstudio.fields.nf_field import ConditionalNFField, DimReducerMLP
 
 
 def _make_field(context_dim, **kwargs):
@@ -96,3 +97,45 @@ def test_condition_discriminates_two_clusters():
         samples = field.sample(num_samples=200, context=cond_a)
         assert (samples.mean(dim=0) - mean_a).abs().max() < 1.0, "samples under cond_a should cluster near mean_a"
         assert (samples.std(dim=0) - data_std).abs().max() < 0.3, "sample spread should roughly match the true generating std"
+
+
+def test_dim_reducer_mlp_layer_sizes():
+    # 384 // 8 == 48, 48 // 8 == 6 (== out_dim, loop stops), final Linear(48, 6).
+    reducer = DimReducerMLP(384, 6, divide_factor=8)
+    linears = [m for m in reducer.net if isinstance(m, nn.Linear)]
+    assert [(l.in_features, l.out_features) for l in linears] == [(384, 48), (48, 6)]
+
+    # 768 // 8 == 96, 96 // 8 == 12, 12 // 8 == 1 (not > 6, loop stops), final Linear(12, 6).
+    reducer2 = DimReducerMLP(768, 6, divide_factor=8)
+    linears2 = [m for m in reducer2.net if isinstance(m, nn.Linear)]
+    assert [(l.in_features, l.out_features) for l in linears2] == [(768, 96), (96, 12), (12, 6)]
+
+    x = torch.randn(5, 768)
+    assert reducer2(x).shape == (5, 6)
+
+
+def test_reduce_dim_none_is_identity():
+    field = _make_field(context_dim=8, reduce_dim=None)
+    assert isinstance(field.reduce, nn.Identity)
+
+    # the flow's coupling layers must condition on the raw (unreduced) 8-dim
+    # context -- num_dims (6) + context_dim (8) == 14 input features.
+    first_coupling = field.flow._flow_modules[0]
+    assert first_coupling.scale_net[0].in_features == 14
+
+
+def test_reduce_dim_shapes_and_joint_gradient():
+    field = _make_field(context_dim=384, cond_prior=True, reduce_dim=6)
+    assert isinstance(field.reduce, DimReducerMLP)
+
+    x = torch.randn(10, 6)
+    cond = torch.randn(10, 384)
+    assert field.reduce(cond).shape == (10, 6)
+
+    log_prob = field.log_prob(x, cond)
+    assert log_prob.shape == (10, 1)
+    (-log_prob.mean()).backward()
+
+    reduce_linears = [m for m in field.reduce.net if isinstance(m, nn.Linear)]
+    assert any(l.weight.grad is not None and l.weight.grad.abs().sum() > 0 for l in reduce_linears), \
+        "reduction MLP should receive gradients when trained jointly through field.log_prob"

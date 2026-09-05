@@ -1,30 +1,35 @@
 #!/usr/bin/env python
 """Local interactive point picker for the conditional-NF probe workflow.
 
-Opens a matplotlib window with the bonsai training images (and any --extra
-images you pass). Click points on the objects you want to probe; the script
-prints a ready-to-paste `COORDS` block for the Kaggle notebook's cell 6a (and,
-equivalently, for `kaggle_explorer.py` / `app/gradio_app.py`).
+Opens a matplotlib window with the primary scene's training images (default
+bonsai -- change with --scene), plus any --also-scenes Mip-NeRF 360 scenes and
+any --extra images you pass. Click points on the objects you want to probe;
+the script prints a ready-to-paste `COORDS` block for the Kaggle notebook's
+cell 6a (and, equivalently, for `kaggle_explorer.py` / `app/gradio_app.py`).
 
 Each `COORDS` entry is `["name.ext", x, y]` -- the image's basename:
-  * a bonsai frame  -> found in the notebook's images_<downscale>/ folder
-  * any other image -> on Kaggle, attach a Dataset containing that file (it is
-    looked up by name under /kaggle/input/**)
+  * a --scene frame -> found in the notebook's images_<downscale>/ folder
+  * any other image (an --also-scenes frame or an --extra file) -> on Kaggle,
+    attach a Dataset containing that file (it is looked up by name under
+    /kaggle/input/**)
 Referencing frames by filename (not by position) keeps the picker and the
 notebook aligned. `[frame_int, x, y]` is still accepted by cell 6b for the old
 index form.
 
-Coordinates are in that image's own pixel space. For an external image only its
-DINOv2 feature at the clicked pixel is used -- the sampled novel views are still
-rendered as bonsai views through the frozen bonsai NeRF, so it is most useful
-when the external image shows similar content.
+Coordinates are in that image's own pixel space. For anything other than a
+--scene frame, only its DINOv2 feature at the clicked pixel is used -- the
+sampled novel views are still rendered through the frozen --scene NeRF, so
+it's most useful when the other image shows similar content (e.g. picking on
+counter/kitchen/room while probing a bonsai-trained NeRF).
 
-Deps: matplotlib, Pillow, and (only for the one-time bonsai download) remotezip
+Deps: matplotlib, Pillow, and (only for the one-time scene downloads) remotezip
 -- NOT the full nerfstudio stack.
 
-    python app/pick_points.py                          # dataset frames (downloads bonsai images once)
-    python app/pick_points.py --extra ~/photo.jpg      # dataset frames + one external image
-    python app/pick_points.py --extra-only --extra a.jpg b.png   # only the external images
+    python app/pick_points.py                              # bonsai frames (downloads once)
+    python app/pick_points.py --scene counter               # counter frames instead
+    python app/pick_points.py --also-scenes counter kitchen room  # + those scenes as external picks
+    python app/pick_points.py --extra ~/photo.jpg           # + one external image
+    python app/pick_points.py --extra-only --extra a.jpg b.png    # only the external images
 
 Controls: click on the image = add a point. Buttons along the bottom
 (Prev / Next / Undo / Reset / Print / Done) and a "go to" box to jump to an
@@ -42,9 +47,13 @@ from PIL import Image
 
 # Mip-NeRF 360 archive (same source scripts/downloads/download_mipnerf360.py uses).
 ARCHIVE_URL = "http://storage.googleapis.com/gresearch/refraw360/360_v2.zip"
+# Kept in sync by hand with scripts/downloads/download_mipnerf360.py's SCENES --
+# not imported from there, since that module pulls in the full nerfstudio stack
+# (colmap_to_json) that this script deliberately avoids.
+SCENES = ("bonsai", "counter", "kitchen", "room")
 
 
-def download_scene_images(scene_dir: Path, scene: str = "bonsai") -> None:
+def download_scene_images(scene_dir: Path, scene: str) -> None:
     """Fetch just <scene>/images/* from the remote archive via HTTP range
     requests into scene_dir/images/. No nerfstudio, no COLMAP conversion --
     picking points only needs the pixels, not transforms.json."""
@@ -80,7 +89,7 @@ def download_scene_images(scene_dir: Path, scene: str = "bonsai") -> None:
             print(f"  {done}/{len(members)}")
 
 
-def ensure_scene(scene_dir: Path, downscale: int) -> list:
+def ensure_scene(scene_dir: Path, downscale: int, scene: str) -> list:
     """Make sure <scene_dir>/images_<downscale>/ exists, downloading + resizing
     as needed, and return the sorted list of its image paths."""
     scene_dir = scene_dir.expanduser().resolve()
@@ -88,7 +97,7 @@ def ensure_scene(scene_dir: Path, downscale: int) -> list:
     dst = scene_dir / f"images_{downscale}"
 
     if not src.is_dir() or not any(src.iterdir()):
-        download_scene_images(scene_dir)
+        download_scene_images(scene_dir, scene)
 
     src_imgs = sorted(p for p in src.glob("*") if p.is_file())
     if not src_imgs:
@@ -109,24 +118,34 @@ def ensure_scene(scene_dir: Path, downscale: int) -> list:
 
 
 def build_items(args) -> list:
-    """Ordered list of browsable images: dataset frames first, then --extra.
+    """Ordered list of browsable images: primary-scene frames, then
+    --also-scenes frames, then --extra.
 
-    Each item is (name, path, is_external). `name` (the file's basename) is what
-    goes into COORDS -- referencing frames by filename, not position, keeps the
-    picker and the Kaggle notebook aligned even if their image sets differ
-    slightly."""
+    Each item is (name, path, is_external, origin). `name` (the file's
+    basename) is what goes into COORDS -- referencing frames by filename, not
+    position, keeps the picker and the Kaggle notebook aligned even if their
+    image sets differ slightly. `origin` is the scene name for dataset/
+    also-scenes frames, or "extra" for --extra files."""
     items, seen = [], {}
-    if not args.extra_only:
-        for p in ensure_scene(args.scene_dir, args.downscale):
-            items.append((p.name, p, False))
+
+    def add_scene(scene: str, is_external: bool):
+        for p in ensure_scene(args.data_root / scene, args.downscale, scene):
+            if p.name in seen:
+                raise SystemExit(f"{scene!r} frame {p.name!r} clashes with an existing image name; rename it")
+            items.append((p.name, p, is_external, scene))
             seen[p.name] = True
+
+    if not args.extra_only:
+        add_scene(args.scene, False)
+        for scene in args.also_scenes:
+            add_scene(scene, True)
     for e in args.extra or []:
         p = Path(e).expanduser().resolve()
         if not p.is_file():
             raise SystemExit(f"--extra file not found: {p}")
         if p.name in seen:
-            raise SystemExit(f"--extra {p.name!r} clashes with a dataset frame name; rename it")
-        items.append((p.name, p, True))
+            raise SystemExit(f"--extra {p.name!r} clashes with an existing image name; rename it")
+        items.append((p.name, p, True, "extra"))
         seen[p.name] = True
     if not items:
         raise SystemExit("nothing to show (use --extra, or drop --extra-only)")
@@ -136,15 +155,21 @@ def build_items(args) -> list:
 def format_block(coords: list, items: list) -> str:
     if not coords:
         return "COORDS = []  # nothing picked"
-    ext = {name for name, _, is_ext in items if is_ext}
+    origin = {name: o for name, _, _, o in items}
+    is_ext = {name: e for name, _, e, _ in items}
     frame_no = {name: n for n, name in
-                enumerate(name for name, _, is_ext in items if not is_ext)}
+                enumerate(name for name, _, is_external, _ in items if not is_external)}
     lines = ["COORDS = ["]
     for name, x, y in coords:
-        if name in ext:
-            lines.append(f'    ["{name}", {x}, {y}],  # EXTERNAL - attach a Kaggle Dataset containing {name!r}')
+        o = origin.get(name)
+        if not is_ext.get(name):
+            comment = f"{o} frame {frame_no.get(name, '?')}"
+        elif o == "extra":
+            comment = f"EXTERNAL - attach a Kaggle Dataset containing {name!r}"
         else:
-            lines.append(f'    ["{name}", {x}, {y}],  # bonsai frame {frame_no.get(name, "?")}')
+            comment = (f"EXTERNAL ({o} scene) - attach a Kaggle Dataset containing {name!r}, "
+                       f"or fetch it via scripts/downloads/download_mipnerf360.py --scene {o}")
+        lines.append(f'    ["{name}", {x}, {y}],  # {comment}')
     lines.append("]")
     return "\n".join(lines)
 
@@ -153,14 +178,22 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--scene-dir", type=Path, default=Path("data/mipnerf360/bonsai"))
+    ap.add_argument("--scene", default="bonsai", choices=SCENES,
+                    help="primary scene -- the one the frozen NeRF is/will be trained on; "
+                         "its frames are the non-external COORDS entries")
+    ap.add_argument("--also-scenes", nargs="+", metavar="SCENE", default=[], choices=SCENES,
+                    help="additional Mip-NeRF 360 scenes to browse/pick on (auto-downloaded "
+                         "like --scene); their frames are treated as external (DINO feature only)")
+    ap.add_argument("--data-root", type=Path, default=Path("data/mipnerf360"),
+                    help="root folder holding <scene>/images/ for --scene and --also-scenes")
     ap.add_argument("--downscale", type=int, default=2)
-    ap.add_argument("--max-points", type=int, default=20,
-                    help="safety cap on how many points you can drop in one session")
+    ap.add_argument("--max-points", type=int, default=None,
+                    help="optional safety cap on how many points you can drop in one session "
+                         "(default: unlimited)")
     ap.add_argument("--extra", nargs="+", metavar="IMG",
                     help="local image file(s) to pick on in addition to the dataset frames")
     ap.add_argument("--extra-only", action="store_true",
-                    help="browse only --extra images; skip the bonsai download")
+                    help="browse only --extra images; skip the scene downloads")
     ap.add_argument("--out", type=Path, default=None, help="also write the block here")
     args = ap.parse_args()
 
@@ -172,10 +205,12 @@ def main():
         )
     if args.extra_only and not args.extra:
         raise SystemExit("--extra-only needs --extra")
+    if args.scene in args.also_scenes:
+        raise SystemExit(f"--scene {args.scene!r} also appears in --also-scenes; drop one")
 
     items = build_items(args)
-    n_ext = sum(is_ext for _, _, is_ext in items)
-    print(f"{len(items)} images ({len(items) - n_ext} bonsai frames + {n_ext} external)")
+    n_ext = sum(is_ext for _, _, is_ext, _ in items)
+    print(f"{len(items)} images ({len(items) - n_ext} {args.scene} frames + {n_ext} external)")
 
     state = {"i": 0}
     coords: list = []  # [ [name, x, y], ... ]  name = the image's basename
@@ -193,7 +228,7 @@ def main():
 
     def show():
         ax.clear()
-        name, path, is_ext = items[state["i"]]
+        name, path, is_ext, origin = items[state["i"]]
         img = Image.open(path)
         ax.imshow(img)
         r = max(img.size) // 45
@@ -201,9 +236,10 @@ def main():
             if cname == name:
                 ax.add_patch(Circle((x, y), radius=r, fill=False, color="red", lw=2))
                 ax.text(x + r, y - r, str(k), color="red", fontsize=13, weight="bold")
-        kind = "EXTERNAL" if is_ext else "bonsai"
+        kind = f"EXTERNAL ({origin})" if is_ext else origin
+        cap = args.max_points if args.max_points is not None else "∞"
         ax.set_title(
-            f"[{state['i']}/{len(items) - 1}]  {kind}  {name}   points: {len(coords)}/{args.max_points}"
+            f"[{state['i']}/{len(items) - 1}]  {kind}  {name}   points: {len(coords)}/{cap}"
             f"\nclick = add point   (buttons below, or keys n/p u r s q)"
         )
         ax.set_xlabel("x (px)")
@@ -222,7 +258,7 @@ def main():
             print(f"index {i} out of range 0..{len(items) - 1}")
 
     def add_point(x, y):
-        if len(coords) >= args.max_points:
+        if args.max_points is not None and len(coords) >= args.max_points:
             print(f"already at {args.max_points} points (undo / reset first)")
             return
         name = items[state["i"]][0]
@@ -282,7 +318,7 @@ def main():
         if text.isdigit():
             goto(int(text))
             return
-        hit = next((k for k, (name, _, _) in enumerate(items)
+        hit = next((k for k, (name, _, _, _) in enumerate(items)
                     if text.lower() in name.lower()), None)
         if hit is None:
             print(f"no image matching {text!r}")
@@ -298,12 +334,16 @@ def main():
 
     block = format_block(coords, items)
     print("\n" + block + "\n")
-    ext_names = {name for name, _, is_ext in items if is_ext}
-    picked_ext = sorted({name for name, _, _ in coords if name in ext_names})
+    ext_origin = {name: o for name, _, is_ext, o in items if is_ext}
+    picked_ext = sorted({name for name, _, _ in coords if name in ext_origin})
     if picked_ext:
-        print("external images picked -- put these in a Kaggle Dataset and attach it:")
+        print("external images picked -- put these in a Kaggle Dataset and attach it")
+        print("(or, for a Mip-NeRF 360 scene, let the notebook fetch it via "
+              "scripts/downloads/download_mipnerf360.py):")
         for name in picked_ext:
-            print(f"  {name}")
+            o = ext_origin[name]
+            tag = f" ({o} scene)" if o != "extra" else ""
+            print(f"  {name}{tag}")
     if args.out:
         args.out.write_text(block + "\n")
         print(f"wrote {args.out}")

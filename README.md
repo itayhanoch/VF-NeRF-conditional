@@ -53,8 +53,11 @@ The original registration pipeline (`reg_pipeline*.py`, `scripts/fgr.py`, the
 3. **Explore interactively**, locally, once both checkpoints are downloaded --
    `app/gradio_app.py` (`pip install -e ".[ui]"` first): pick a training image (or
    upload an external one), click a point, and the conditional NF samples 100
-   `(position, direction)` candidates ranked by likelihood; pick 1-5 to render as
-   novel views through the frozen NeRF.
+   `(position, direction)` candidates ranked by likelihood; pick any to render as
+   novel views through the frozen NeRF. To probe on Kaggle instead, use
+   `app/pick_points.py` locally to click the points and paste the list into
+   [`notebooks/train_vf_nerf_kaggle.ipynb`](notebooks/train_vf_nerf_kaggle.ipynb)
+   cell 6a (cell 6b then renders them).
 
 ## 1. Installation: Setup the environment
 
@@ -160,58 +163,68 @@ which handles Drive-mounted checkpointing so training survives disconnects.
 
 Instead of clicking through [`notebooks/train_conditional_nf_colab.ipynb`](notebooks/train_conditional_nf_colab.ipynb)
 in a browser, Google's official [`google-colab-cli`](https://github.com/googlecolab/google-colab-cli)
-(shipped June 2026) drives a real Colab GPU runtime from your own terminal --
-no browser round-trips, and (unlike older `colab-ssh`/ngrok tunneling tricks,
-now against Colab's terms of service) it's Google's own sanctioned tool.
+drives a real Colab GPU runtime from your own terminal. `colab exec -f <script.py>`
+runs a **local** Python script *on* the remote VM and streams its output back --
+it does not open an interactive shell, so the setup below uses a launcher script
+that writes and detaches a background bash job, rather than a chain of individual
+commands (an interactive `pip install torch==1.13.1 ...` one-liner run this way
+hits real, previously-debugged failures: Colab's system Python is too new for
+the `cu117` wheels this repo needs, the CUDA 11.7 dev headers tiny-cuda-nn's
+build needs aren't preinstalled, `setuptools>=81` silently breaks `pkg_resources`,
+and training on full-resolution images OOMs on a free-tier T4 -- all of which the
+scripts below already work around).
 
 ```bash
 pip install google-colab-cli   # or: uv tool install google-colab-cli
 
-colab new --gpu T4              # provision a runtime (plain --gpu isn't documented
-                                 # as Pro-only; --high-mem explicitly requires Colab Pro/Pro+)
-colab console                   # drop into a raw shell on that VM
+colab new --gpu T4   # opens a browser OAuth prompt once; note the session alias it prints
 ```
 
-From the `colab console` shell, this is an ordinary terminal on the remote VM --
-run the same commands you would locally:
+**1. Launch setup + training** ([`scripts/colab/launch_train.py`](scripts/colab/launch_train.py)
+builds an isolated Python 3.10 venv, installs the CUDA 11.7 toolchain, compiles
+tiny-cuda-nn, clones the repo, applies a known upstream eval bugfix, downloads
+the `bonsai` scene, generates downscaled training images, and launches
+`ns-train nerfacto` -- all via a single `nohup`'d background job on the VM, so it
+survives the `exec` call returning):
 
 ```bash
-git clone https://github.com/itayhanoch/VF-NeRF-conditional.git
-cd VF-NeRF-conditional
-pip install torch==1.13.1 torchvision functorch --extra-index-url https://download.pytorch.org/whl/cu117
-pip install ninja "git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch"
-pip install -e . && pip install -e ./normalizing-flows
-
-python scripts/downloads/download_mipnerf360.py --scene bonsai --save-dir data/mipnerf360
-ns-train nerfacto --data data/mipnerf360/bonsai
-python scripts/train_conditional_nf.py \
-    --nerf-config outputs/bonsai/nerfacto/TIMESTAMP/config.yml \
-    --scene-dir data/mipnerf360/bonsai \
-    --checkpoint-dir checkpoints/conditional_nf/bonsai
+colab exec -s <session> -f scripts/colab/launch_train.py --timeout 60
 ```
 
-Useful CLI commands from your own terminal (outside `colab console`), run against
-the same session with `-s NAME` or the most recent one by default:
-- `colab drivemount` -- mount Google Drive, so checkpoints can land in the same
-  Drive path the notebook uses, for resuming across sessions (see "GPU budget" below).
-- `colab install -r requirements.txt` -- install deps via uv/pip without dropping into the console.
-- `colab upload`/`colab download` -- move files to/from the VM directly.
+**2. Poll progress** ([`scripts/colab/check_status.py`](scripts/colab/check_status.py)
+prints whether the job is still running, its last log lines, and any traceback
+count -- repeat this every few minutes rather than leaving the terminal idle,
+since an idle Colab connection is what disconnects the session):
+
+```bash
+colab exec -s <session> -f scripts/colab/check_status.py --timeout 30
+```
+
+**3. Download the checkpoint the moment it finishes** -- this script does **not**
+mount Google Drive, so the checkpoint only exists on the ephemeral VM disk until
+downloaded. Do this immediately, with no chat/thinking pause in between (a
+disconnect between "training finished" and "checkpoint downloaded" is a real,
+unrecoverable loss -- it has happened twice in this project):
+
+```bash
+colab download -s <session> /content/VF-NeRF-conditional/outputs "./checkpoints/nerfacto_bonsai"
+```
+
+Other useful commands, run from your own terminal against the same session
+with `-s <session>`:
 - `colab status` / `colab sessions` -- check what's running and its hardware.
-- `colab stop` -- tear the session down when done.
+- `colab log -s <session>` -- raw session log, if `check_status.py` isn't enough.
+- `colab stop -s <session>` -- tear the session down when done.
+- If `colab new` fails with `TooManyAssignmentsError`, a previous session is
+  still holding a GPU/CPU reservation -- go to colab.research.google.com ->
+  Runtime -> Manage sessions and terminate it there before retrying.
 
-Auth is a one-time `--auth {oauth2,adc}` login (default `adc`), not per-command.
-
-### GPU budget: splitting nerfacto and conditional-NF training across sessions
-
-A free-tier T4 is meaningfully slower than the GPUs typical benchmarks are run
-on -- training the frozen nerfacto backbone for the default 30,000 iterations
-plus the one-time tiny-cuda-nn compile step can plausibly take 30-70+ minutes,
-which may not comfortably fit in a single free-tier session alongside the
-conditional-NF training too. Since both the notebook and `ns-train`'s own
-checkpointing land on Google Drive, the two steps don't need to happen in the
-same session:
-1. **Session 1**: `colab new --gpu T4` -> `colab drivemount` -> train nerfacto only, to a Drive-backed output dir.
-2. **Session 2** (later, fresh daily quota): `colab new --gpu T4` -> `colab drivemount` -> point `--nerf-config` at the checkpoint saved in session 1, and run only `scripts/train_conditional_nf.py` (much cheaper -- small MLPs, no tiny-cuda-nn, no hash grid).
+Once the frozen NeRF checkpoint is downloaded, `scripts/train_conditional_nf.py`
+(step 4 below) can run the same way: write a second launcher script that installs
+into the same venv and calls it directly (much cheaper than nerfacto training --
+small MLPs, no tiny-cuda-nn, no hash grid), or just use the notebook for that
+step, which mounts Drive and persists checkpoints as it trains instead of only
+at the end.
 
 ## 5. Explore interactively
 
@@ -222,6 +235,37 @@ python app/gradio_app.py \
     --cond-nf-checkpoint checkpoints/conditional_nf/{scene}/latest.pt \
     --scene-dir {PROCESSED_DATA_DIR}
 ```
+
+### Picking probe points for the Kaggle notebook
+
+If you probe the conditional NF on Kaggle instead (see
+[`notebooks/train_vf_nerf_kaggle.ipynb`](notebooks/train_vf_nerf_kaggle.ipynb) --
+Kaggle's JupyterLab has no `ipympl` widget frontend, so there is no in-notebook
+click capture), pick the points here first. This tool needs only
+`matplotlib` + `Pillow` (+ `remotezip` for the one-time image download), not the
+full stack:
+
+```bash
+pip install matplotlib pillow remotezip
+
+python app/pick_points.py                      # bonsai training frames (downloads them once)
+python app/pick_points.py --also-scenes counter kitchen room  # + those scenes as external picks
+python app/pick_points.py --extra ~/photo.jpg  # also pick on your own image(s)
+python app/pick_points.py --extra-only --extra a.jpg b.png   # only your images (no download)
+```
+
+It opens the images in a window; page with the on-screen buttons (or `n`/`p`),
+click the objects you want to probe, and it prints a `COORDS` block to paste into
+the notebook's cell 6a. Each entry is `["name.ext", x, y]` -- the image's
+basename. A bonsai frame is matched by filename in the notebook's `images_2/`; any
+other name is an external image (attach a Kaggle Dataset containing it; it is
+looked up under `/kaggle/input/**`). Referencing frames by filename rather than
+position keeps the picker and the notebook aligned. Coordinates are in that
+image's own pixels.
+
+For an external image only its DINOv2 feature at the clicked pixel is used -- the
+sampled novel views are still rendered as bonsai views through the frozen bonsai
+NeRF, so it is most useful when the external image shows similar content.
 
 
 # Built On

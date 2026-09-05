@@ -46,6 +46,8 @@ def parse_args():
     p.add_argument("--dino-model", default="dinov2_vits14")
     p.add_argument("--num-blocks", type=int, default=8)
     p.add_argument("--hidden-dim", type=int, default=128)
+    p.add_argument("--reduce-dim", type=int, default=None, help="If set, reduce the DINO condition to this many dims (via a jointly-trained MLP) before it reaches the flow. Default: no reduction.")
+    p.add_argument("--reduce-divide-factor", type=int, default=8, help="Division factor for the reduction MLP's hidden layers (only used when --reduce-dim is set)")
     p.add_argument("--cond-prior", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--use-batchnorm", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--batch-size", type=int, default=4096)
@@ -185,6 +187,8 @@ def main():
         cond_prior=args.cond_prior,
         use_cond_in_coupling=True,
         use_batchnorm=args.use_batchnorm,
+        reduce_dim=args.reduce_dim,
+        reduce_divide_factor=args.reduce_divide_factor,
         device=str(device),
     )
     optimizer = RAdam(field.parameters(), lr=args.lr, eps=0.1)
@@ -198,6 +202,8 @@ def main():
         hidden_dim=args.hidden_dim,
         cond_prior=args.cond_prior,
         use_batchnorm=args.use_batchnorm,
+        reduce_dim=args.reduce_dim,
+        reduce_divide_factor=args.reduce_divide_factor,
         dino_model_name=args.dino_model,
     )
 

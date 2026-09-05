@@ -15,6 +15,7 @@ conditional-NF checkpoint (.pt, from scripts/train_conditional_nf.py) locally:
         --scene-dir data/mipnerf360/bonsai
 """
 import argparse
+import math
 from pathlib import Path
 from typing import List, Tuple
 
@@ -108,6 +109,8 @@ def load_conditional_nf(checkpoint_path: Path, device: torch.device) -> Tuple[Co
         cond_prior=ckpt["cond_prior"],
         use_cond_in_coupling=True,
         use_batchnorm=ckpt["use_batchnorm"],
+        reduce_dim=ckpt.get("reduce_dim"),
+        reduce_divide_factor=ckpt.get("reduce_divide_factor", 8),
         device=str(device),
     )
     field.load_state_dict(ckpt["model_state"])
@@ -173,6 +176,26 @@ class InteractiveApp:
         py = min(max(int(y * hp / h), 0), hp - 1)
         return grid[:, py, px].reshape(-1).clone()
 
+    def _probe_depth(self, cam_idx: int, x: int, y: int, img_h: int, img_w: int) -> float:
+        """Median NeRF termination depth along training-camera `cam_idx`'s ray through
+        pixel (x, y) -- the true camera-to-surface distance for this probe, used as the
+        render backoff instead of the scene-wide constant. `(x, y)` are in the clicked
+        image's pixel space; the camera may be at a different downscale, hence the
+        `cam_h/img_h` scaling. Falls back to `self.backoff_distance` on a sky/background
+        hit (non-finite or ~0 depth)."""
+        cam_h = float(self.reference_cameras.height[cam_idx])
+        cam_w = float(self.reference_cameras.width[cam_idx])
+        ray_bundle = self.reference_cameras.generate_rays(
+            camera_indices=torch.tensor([[cam_idx]]),
+            coords=torch.tensor([[y * cam_h / img_h, x * cam_w / img_w]], dtype=torch.float32),
+        ).to(self.device)
+        with torch.no_grad():
+            t = float(self.nerf_model(ray_bundle)["depth"].reshape(-1)[0])
+        if not math.isfinite(t) or t <= 1e-4:
+            print(f"depth render at ({x},{y}) = {t!r}; using constant backoff {self.backoff_distance:.3f}")
+            return self.backoff_distance
+        return t
+
     @staticmethod
     def _click_xy(evt: gr.SelectData):
         if evt is None or evt.index is None or evt.index[0] is None:
@@ -183,7 +206,10 @@ class InteractiveApp:
         x, y = self._click_xy(evt)
         grid, h, w = self._patch_grid(Path(image_path_str))
         cond = self._pixel_to_patch_feature(grid, h, w, x, y)
-        return cond, mark_point(Image.open(image_path_str), x, y)
+        # dropdown choices ARE image_choices() in reference_cameras order.
+        cam_idx = self.image_choices().index(image_path_str)
+        backoff = self._probe_depth(cam_idx, x, y, h, w)
+        return cond, mark_point(Image.open(image_path_str), x, y), backoff
 
     def external_image_condition(self, pil_image, evt: gr.SelectData):
         x, y = self._click_xy(evt)
@@ -192,7 +218,8 @@ class InteractiveApp:
         with torch.no_grad():
             grid, (h, w) = self.extractor.extract_patch_grid(img)
         cond = self._pixel_to_patch_feature(grid.float().cpu(), int(h), int(w), x, y)
-        return cond, mark_point(pil_image, x, y)
+        # no camera for an external image in the trained frame -> scene-wide constant.
+        return cond, mark_point(pil_image, x, y), self.backoff_distance
 
     # --- sample / rank / render -------------------------------------------------
 
@@ -214,13 +241,14 @@ class InteractiveApp:
         return samples.cpu(), rows
 
     def render_selected(self, samples: torch.Tensor, selected_labels: List[str],
-                        render_downscale: float = 3.0) -> List[np.ndarray]:
+                        render_downscale: float = 3.0, backoff: float = None) -> List[np.ndarray]:
+        backoff = self.backoff_distance if backoff is None else backoff
         images = []
         for label in selected_labels:
             idx = int(label)
             pos = samples[idx, :3].to(self.device)
             dirn = samples[idx, 3:].to(self.device)
-            camera = build_camera_from_point_direction(pos, dirn, self.reference_cameras, self.backoff_distance)
+            camera = build_camera_from_point_direction(pos, dirn, self.reference_cameras, backoff)
             if render_downscale and render_downscale != 1.0:
                 camera.rescale_output_resolution(1.0 / render_downscale)
             ray_bundle = camera.generate_rays(camera_indices=0)
@@ -238,6 +266,7 @@ def build_ui(app: InteractiveApp, render_downscale_default: float = 3.0) -> gr.B
         gr.Markdown("# Conditional-NF Novel View Explorer")
         condition_state = gr.State(value=None)
         samples_state = gr.State(value=None)
+        backoff_state = gr.State(value=None)  # per-probe render backoff (NeRF depth for dataset frames)
 
         with gr.Tabs():
             with gr.TabItem("Training-set image"):
@@ -251,16 +280,16 @@ def build_ui(app: InteractiveApp, render_downscale_default: float = 3.0) -> gr.B
 
         selected_point = gr.Image(label="Selected point (source of the DINO condition)", interactive=False)
         train_image.select(app.training_image_condition, inputs=image_dropdown,
-                           outputs=[condition_state, selected_point])
+                           outputs=[condition_state, selected_point, backoff_state])
         external_image.select(app.external_image_condition, inputs=external_image,
-                              outputs=[condition_state, selected_point])
+                              outputs=[condition_state, selected_point, backoff_state])
 
         num_samples = gr.Slider(minimum=20, maximum=500, value=100, step=10, label="Samples to draw")
         sample_btn = gr.Button("Sample")
         results_table = gr.Dataframe(
             headers=columns, label=f"Top {TOP_K_SHOWN} candidates, ranked by log-likelihood",
             interactive=False, col_count=(len(columns), "fixed"), datatype="number")
-        selection = gr.CheckboxGroup(choices=[], label="Select 1-5 candidates to render (by #)")
+        selection = gr.CheckboxGroup(choices=[], label="Select candidates to render (by #)")
 
         def do_sample(condition, n):
             if condition is None:
@@ -276,14 +305,12 @@ def build_ui(app: InteractiveApp, render_downscale_default: float = 3.0) -> gr.B
         render_btn = gr.Button("Render selected")
         gallery = gr.Gallery(label="Novel views", columns=5, height="auto", object_fit="contain")
 
-        def do_render(samples, selected, downscale):
+        def do_render(samples, selected, downscale, backoff):
             if not selected:
                 raise gr.Error("Select at least one candidate.")
-            if len(selected) > 5:
-                raise gr.Error("Select at most 5 candidates.")
-            return app.render_selected(samples, selected, render_downscale=float(downscale))
+            return app.render_selected(samples, selected, render_downscale=float(downscale), backoff=backoff)
 
-        render_btn.click(do_render, inputs=[samples_state, selection, render_downscale], outputs=gallery)
+        render_btn.click(do_render, inputs=[samples_state, selection, render_downscale, backoff_state], outputs=gallery)
 
     return demo
 
