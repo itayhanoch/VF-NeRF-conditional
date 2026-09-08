@@ -61,6 +61,25 @@ def _pad_to_patch_multiple(image_chw: torch.Tensor, patch_size: int = PATCH_SIZE
     return padded, (h, w)
 
 
+def patch_pixel_box(py, px, h: int, w: int):
+    """Patch cell (py, px) -> (x0, y0, side_x, side_y) in the pixels of an image whose
+    NATIVE size is (h, w) -- the (h, w) `extract_patch_grid` hands back.
+
+    Patch cells tile the reflection-padded image in exact `PATCH_SIZE` steps and the
+    padding only ever extends the right/bottom edges, so cell (py, px) covers
+    [px*14, px*14+14) x [py*14, py*14+14) of the pixels the forward pass actually saw.
+    An image whose long side exceeds `MAX_DINO_SIDE` is bilinearly downscaled for that
+    forward pass only, so one cell then covers `PATCH_SIZE / scale` native pixels.
+
+    `py`/`px` may be ints or tensors (the arithmetic broadcasts). The box for the last
+    row/column can extend past `h`/`w` -- that is the padded strip the cell genuinely
+    covers, not an error.
+    """
+    scale = min(1.0, MAX_DINO_SIDE / max(h, w))
+    side = PATCH_SIZE / scale
+    return px * side, py * side, side, side
+
+
 def _normalize_for_dinov2(rgb_chw_01: torch.Tensor) -> torch.Tensor:
     """[3,H,W] in [0,1] -> normalized with DINOv2's ImageNet stats (required --
     DINOv2 was pretrained on inputs preprocessed this exact way)."""

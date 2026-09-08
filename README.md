@@ -182,7 +182,7 @@ colab new --gpu T4   # opens a browser OAuth prompt once; note the session alias
 
 **1. Launch setup + training** ([`scripts/colab/launch_train.py`](scripts/colab/launch_train.py)
 builds an isolated Python 3.10 venv, installs the CUDA 11.7 toolchain, compiles
-tiny-cuda-nn, clones the repo, applies a known upstream eval bugfix, downloads
+tiny-cuda-nn, clones the repo, downloads
 the `bonsai` scene, generates downscaled training images, and launches
 `ns-train nerfacto` -- all via a single `nohup`'d background job on the VM, so it
 survives the `exec` call returning):

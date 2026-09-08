@@ -60,17 +60,21 @@ def parse_args():
     return p.parse_args()
 
 
-def build_training_cameras(scene_dir: Path, dataparser_config=None):
+def build_training_cameras(scene_dir: Path, dataparser_config=None, split: str = "train"):
     """Cameras + image paths in the frozen NeRF's own dataparser frame.
 
     Pass the checkpoint's dataparser config so center-method / scene-scale /
     downscale-factor match what the NeRF (and hence these targets) were trained
     in; falls back to stock defaults when not given.
+
+    `split` is "train" for the frames the NeRF (and this flow) train on, or
+    "test"/"val" for the held-out remainder -- the only reason to pass anything
+    but the default is a held-out evaluation (scripts/eval_cond_nf_likelihood.py).
     """
     if dataparser_config is None:
         dataparser_config = NerfstudioDataParserConfig()
     dataparser_config.data = Path(scene_dir)
-    outputs = dataparser_config.setup().get_dataparser_outputs(split="train")
+    outputs = dataparser_config.setup().get_dataparser_outputs(split=split)
     return outputs.cameras, outputs.image_filenames
 
 
