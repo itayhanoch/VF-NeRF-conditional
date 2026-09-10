@@ -256,12 +256,69 @@ python app/pick_points.py --extra-only --extra a.jpg b.png   # only your images 
 
 It opens the images in a window; page with the on-screen buttons (or `n`/`p`),
 click the objects you want to probe, and it prints a `COORDS` block to paste into
-the notebook's cell 6a. Each entry is `["name.ext", x, y]` -- the image's
-basename. A bonsai frame is matched by filename in the notebook's `images_2/`; any
-other name is an external image (attach a Kaggle Dataset containing it; it is
-looked up under `/kaggle/input/**`). Referencing frames by filename rather than
-position keeps the picker and the notebook aligned. Coordinates are in that
-image's own pixels.
+the notebook's cell 6a. Each entry is `["name.ext", x, y, "TAG"]` -- the image's
+basename plus where it came from. A bonsai frame is matched by filename in the
+notebook's `images_2/`; any other name is an external image (attach a Kaggle
+Dataset containing it; it is looked up under `/kaggle/input/**`). Referencing
+frames by filename rather than position keeps the picker and the notebook
+aligned. Coordinates are in that image's own pixels.
+
+#### Train / test tags
+
+Frames of the primary `--scene` are tagged `TRAIN` or `TEST` in the window title
+(green / orange-red) and as the **4th field of every emitted row**, so the
+provenance travels with the coordinates instead of living in a comment:
+
+```python
+COORDS = [
+    ["DSCF5565.JPG", 981, 329, "TRAIN"],     # bonsai frame 0
+    ["DSCF5575.JPG", 205, 163, "TEST"],      # bonsai frame 10
+    ["piano.jpeg", 197, 257, "EXTERNAL"],    # attach a Kaggle Dataset containing 'piano.jpeg'
+]
+```
+
+It matters because a `TEST` frame behaves like an external image downstream: it
+has no camera in the train split, so cell 6b's explorer cannot use the frozen
+NeRF's real depth along that pixel's ray and falls back to the scene-wide
+constant backoff.
+
+The tag is provenance, not an input -- nothing branches on it, but cell 6b echoes
+it in its log, on each montage, and into `dino_consistency.json`, so results can
+be split by TRAIN / TEST / EXTERNAL after the fact. The render-backoff override
+that used to be the 4th field is now the 5th
+(`[ref, x, y, "TRAIN", 0.42]`); a bare number in the 4th slot is still read as a
+backoff, so blocks picked before tags existed keep working.
+
+The tags reproduce the dataparser's split exactly (`train_split_fraction = 0.9`,
+equally spaced train indices, remainder held out). That split is positional over
+`transforms.json`'s `frames`, i.e. **COLMAP order, which is not alphabetical** --
+for `counter` and `kitchen` an alphabetical guess would mis-tag 10 and 4 frames.
+So the picker reads the order from the reconstruction: it uses `transforms.json`
+if `scripts/downloads/download_mipnerf360.py` already produced one, otherwise it
+fetches just that scene's `sparse/0/images.bin` once (~30-45 MB, cached). Pass
+`--no-split-tags` to skip the fetch, or `--train-split-fraction` if you changed
+the dataparser's. Anything that goes wrong (offline, no `remotezip`) just prints
+a warning and leaves the frames untagged.
+
+External images are never tagged -- they belong to no split.
+
+#### Downscaling external images
+
+DINOv2 runs at native resolution only up to a 1568px long side; above that it
+features a shrunk copy, so a patch on a 4444px photo covers far more of the scene
+than one on a 1559px training frame. Normalise your external images once, in
+place, before picking:
+
+```bash
+python scripts/downscale_external_images.py --dry-run   # look first
+python scripts/downscale_external_images.py             # rewrite at 1/4 size
+```
+
+Originals are parked in a sibling `external images_originals/`; the rewritten
+files keep their basenames, so `external images/` stays the folder you upload as
+the Kaggle Dataset and the picked coordinates are in the same pixel space the
+notebook loads. Re-running is a no-op. The script warns about any image that ends
+up under ~518px, where a DINO patch smears over a large part of the subject.
 
 For an external image only its DINOv2 feature at the clicked pixel is used -- the
 sampled novel views are still rendered as bonsai views through the frozen bonsai
