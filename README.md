@@ -277,10 +277,12 @@ COORDS = [
 ]
 ```
 
-It matters because a `TEST` frame behaves like an external image downstream: it
-has no camera in the train split, so cell 6b's explorer cannot use the frozen
-NeRF's real depth along that pixel's ray and falls back to the scene-wide
-constant backoff.
+A `TEST` frame is one the frozen NeRF and the flow never saw, but it still has a
+camera pose, and cell 6b's explorer loads the held-out split's cameras too: a
+TEST probe gets the frozen NeRF's real depth along its ray as the render backoff
+(logged as `depth(test)`) and its own 3-D source point, exactly like a TRAIN
+frame. Only EXTERNAL images have no camera -- they fall back to the scene-wide
+constant backoff and get no source point.
 
 The tag is provenance, not an input -- nothing branches on it, but cell 6b echoes
 it in its log, on each montage, and into `dino_consistency.json`, so results can
@@ -323,6 +325,41 @@ up under ~518px, where a DINO patch smears over a large part of the subject.
 For an external image only its DINOv2 feature at the clicked pixel is used -- the
 sampled novel views are still rendered as bonsai views through the frozen bonsai
 NeRF, so it is most useful when the external image shows similar content.
+
+### Reading a probe montage (cell 6b)
+
+One row per probe: the source frame (red box = the 14x14 DINO patch the condition
+was read from, magnified in the corner inset), then the `RENDER_TOP`
+highest-likelihood samples rendered through the frozen NeRF, each carrying:
+
+- a **green wash** over the pixels passing VF-NeRF's view-likelihood mask (the
+  flow's log-density at every pixel's NeRF-depth surface point, min-max
+  normalised per view, cut at `VF_SCORE_THRESHOLD`), opacity ramping 0.2 -> 0.55
+  with that likelihood;
+- a **red box** on the DINO patch the sampled point lands in, with its cosine
+  similarity to the source patch (`pt cos`) in the title -- read it against the
+  scene's same-patch / random-patch cosines from the DINO reconstruction report;
+- a **green circle** where the source pixel's own 3-D point projects into the
+  view (dashed if the render occludes it) and `|S-P|`, the distance between
+  that point and the sampled one, in normalized / original units.
+
+## 6. Evaluation reports
+
+All evaluations run from cells of
+[`notebooks/train_vf_nerf_kaggle.ipynb`](notebooks/train_vf_nerf_kaggle.ipynb);
+each cell zips its outputs to `/kaggle/working/report_<name>.zip` the moment it
+finishes. The scripts behind them run anywhere the stack is installed:
+
+| cell | script | what it answers |
+|---|---|---|
+| 3c | `scripts/depth_probe.py` | what NeRF depth 0.3 / 3.0 looks like per scene (the outlier filter bounds): one frame, the same camera slid to those depths, and the depth map with contours |
+| 5b | `scripts/eval_cond_nf_likelihood.py --depth-range 0.3 3.0 --shuffled` | held-out log-likelihood, raw and with bad-depth samples filtered out, against a **shuffled-condition baseline** (same targets, another pixel's DINO feature -- does the flow use the feature at all?) |
+| 5c | `scripts/eval_cond_nf_nearest_sample.py` | the flow run the other way: 100 samples per pixel, distance / angle of the closest one (`min`) and of the flow's own top-ranked one (`top`) to the true point / direction, hit rate under 5 % of the scene backoff |
+| 6c | `scripts/eval_dino_reconstruction.py` | can DINO on a NeRF render be trusted: same-patch cosine between a real frame and its render (ceiling) vs. a random render patch (floor) |
+
+The standalone [`notebooks/eval_cond_nf_likelihood.ipynb`](notebooks/eval_cond_nf_likelihood.ipynb)
+and [`notebooks/eval_dino_reconstruction.ipynb`](notebooks/eval_dino_reconstruction.ipynb)
+run 5b and 6c against restored checkpoints without training anything.
 
 
 # Built On

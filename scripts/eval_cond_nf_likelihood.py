@@ -13,6 +13,18 @@ training objective: the same continuous sub-pixel sampling, the same DINO patch
 lookup for the condition, the same frozen-NeRF depth render for the 3-D target.
 The only differences are `field.eval()` and no backward pass.
 
+Two extra views of the same samples, both free (same rays, same depth render):
+
+* `--depth-range LO HI` reports every statistic a second time over only the
+  samples whose frozen-NeRF depth lies in [LO, HI]. The catastrophic samples are
+  almost always rays whose depth is nonsense -- a window, the unbounded background
+  (depth ~200) or a point almost on the lens (depth ~0.16) -- so this is the mean/var
+  with the bad-depth outliers taken out of the equation, rather than clipped by rank.
+* `--shuffled` (default on) also scores each target under the DINO feature of a
+  *different* random pixel of the same batch. This is the "does the flow use the
+  condition at all?" baseline: if the shuffled mean sits close to the true one, the
+  flow has learnt the scene's surface layout and ignores the feature.
+
 Example:
     python scripts/eval_cond_nf_likelihood.py \\
         --nerf-config outputs/bonsai/nerfacto/TIMESTAMP/config.yml \\
@@ -48,6 +60,9 @@ def parse_args():
     p.add_argument("--worst-k", type=int, default=20, help="How many of the lowest-log_prob samples to dump in full (with their rendered depth and source image) -- these are what a huge std is usually made of")
     p.add_argument("--save-samples", dest="save_samples", action="store_true", default=True, help="Also write <output-path stem>_samples.npz with the raw per-sample log_prob/depth/camera index for every split, so the report can be re-analysed without re-running (default: on)")
     p.add_argument("--no-save-samples", dest="save_samples", action="store_false")
+    p.add_argument("--depth-range", type=float, nargs=2, default=None, metavar=("LO", "HI"), help="Also report every statistic over only the samples whose rendered depth is within [LO, HI] (normalized scene units) -- the bad-depth outliers removed")
+    p.add_argument("--shuffled", dest="shuffled", action="store_true", default=True, help="Also score each target under a DINO feature permuted within the batch (a different random pixel of the same split) -- the no-condition baseline (default: on)")
+    p.add_argument("--no-shuffled", dest="shuffled", action="store_false")
     return p.parse_args()
 
 
@@ -134,6 +149,38 @@ def describe(vals, mean, var):
     return out
 
 
+def basic_stats(vals):
+    """mean / var / std / median / p5 / p95 / n -- the compact block used for the
+    shuffled baseline and the depth-filtered views, where the full `describe`
+    tail accounting would only repeat itself."""
+    vals = np.asarray(vals, dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    n = int(vals.size)
+    if not n:
+        nan = float("nan")
+        return {"mean": nan, "var": nan, "std": nan, "median": nan, "p5": nan, "p95": nan, "n": 0}
+    var = float(vals.var())
+    return {
+        "mean": float(vals.mean()),
+        "var": var,
+        "std": math.sqrt(var),
+        "median": float(np.median(vals)),
+        "p5": float(np.percentile(vals, 5)),
+        "p95": float(np.percentile(vals, 95)),
+        "n": n,
+    }
+
+
+def shuffled_block(shuf, true):
+    """Stats of the shuffled-condition log-probs plus the gap to the true ones on
+    the same samples. Positive gap = the feature helps."""
+    out = basic_stats(shuf)
+    t = basic_stats(true)
+    out["mean_true_minus_shuffled"] = t["mean"] - out["mean"]
+    out["median_true_minus_shuffled"] = t["median"] - out["median"]
+    return out
+
+
 def load_conditional_nf(checkpoint_path: Path, device: torch.device):
     """Rebuild a ConditionalNFField with the architecture recorded in its own
     checkpoint (same contract as the explorer / gradio app)."""
@@ -193,6 +240,8 @@ def evaluate_split(split, args, config, nerf_model, field, extractor, device):
     n = n_nonfinite = 0
     batch_means, batch_mins, batch_maxes = [], [], []
     keep = {"log_prob": [], "depth": [], "cam_idx": [], "point_norm": []}
+    if args.shuffled:
+        keep["shuffled_log_prob"] = []
     for b in range(args.num_batches):
         with torch.no_grad():
             ray_bundle, conditions = sample_batch(cameras, dino_caches, args.batch_size, device)
@@ -200,6 +249,12 @@ def evaluate_split(split, args, config, nerf_model, field, extractor, device):
             points = ray_bundle.origins + ray_bundle.directions * outputs["depth"]
             x = torch.cat([points, ray_bundle.directions], dim=-1)
             log_prob = field.log_prob(x, conditions).reshape(-1)
+            if args.shuffled:
+                # Same targets, each paired with the feature of another random pixel
+                # of this batch (so still this scene, this split). A second flow
+                # forward only -- the depth render above is the expensive part.
+                perm = torch.randperm(conditions.shape[0], device=conditions.device)
+                log_prob_shuf = field.log_prob(x, conditions[perm]).reshape(-1)
 
         finite = torch.isfinite(log_prob)
         n_nonfinite += int((~finite).sum())
@@ -215,9 +270,18 @@ def evaluate_split(split, args, config, nerf_model, field, extractor, device):
             keep["depth"].append(outputs["depth"].reshape(-1)[finite].float().cpu().numpy())
             keep["cam_idx"].append(ray_bundle.camera_indices.reshape(-1)[finite].cpu().numpy())
             keep["point_norm"].append(points.reshape(-1, 3)[finite].norm(dim=-1).float().cpu().numpy())
+            if args.shuffled:
+                # aligned with the true samples; its own non-finite values (rare,
+                # the target is still a real surface point) stay as nan and are
+                # dropped by basic_stats
+                shuf = log_prob_shuf[finite].double()
+                shuf = torch.where(torch.isfinite(shuf), shuf, torch.full_like(shuf, float("nan")))
+                keep["shuffled_log_prob"].append(shuf.cpu().numpy())
         print(f"[{split}] batch {b + 1}/{args.num_batches} | mean log-prob "
               f"{batch_means[-1] if batch_means else float('nan'):.4f}"
-              f" | min {batch_mins[-1] if batch_mins else float('nan'):.4f}", flush=True)
+              f" | min {batch_mins[-1] if batch_mins else float('nan'):.4f}"
+              + (f" | shuffled mean {float(np.nanmean(keep['shuffled_log_prob'][-1])):.4f}"
+                 if args.shuffled and keep["shuffled_log_prob"] else ""), flush=True)
 
     mean = total / n if n else math.nan
     # population variance from the running sums; clamped because catastrophic
@@ -273,8 +337,33 @@ def evaluate_split(split, args, config, nerf_model, field, extractor, device):
             "min": float(lp[m].min()),
         })
     out["per_image"] = per_image
-    return out, {"log_prob": lp.astype(np.float32), "depth": depth.astype(np.float32),
-                 "cam_idx": cam.astype(np.int32), "point_norm": pnorm.astype(np.float32)}
+
+    shuf = np.concatenate(keep["shuffled_log_prob"]) if args.shuffled else None
+    if shuf is not None:
+        out["shuffled"] = shuffled_block(shuf, lp)
+
+    # The same numbers with the bad-depth samples taken out. `n_kept` next to
+    # `n_samples` says how much the filter actually removed.
+    if args.depth_range is not None:
+        lo, hi = args.depth_range
+        kept = (depth >= lo) & (depth <= hi)
+        out["depth_range"] = [lo, hi]
+        f = {"n_kept": int(kept.sum()), "frac_kept": float(kept.mean())}
+        if kept.any():
+            lpk = lp[kept]
+            f_mean, f_var = float(lpk.mean()), float(lpk.var())
+            f.update({"mean_log_prob": f_mean, "var_log_prob": f_var,
+                      "std_log_prob": math.sqrt(f_var), "n_samples": int(lpk.size)})
+            f.update(describe(lpk, f_mean, f_var))
+            if shuf is not None:
+                f["shuffled"] = shuffled_block(shuf[kept], lpk)
+        out["depth_filtered"] = f
+
+    arrays = {"log_prob": lp.astype(np.float32), "depth": depth.astype(np.float32),
+              "cam_idx": cam.astype(np.int32), "point_norm": pnorm.astype(np.float32)}
+    if shuf is not None:
+        arrays["shuffled_log_prob"] = shuf.astype(np.float32)
+    return out, arrays
 
 
 def main():
@@ -305,6 +394,8 @@ def main():
         "batch_size": args.batch_size,
         "num_batches": args.num_batches,
         "seed": args.seed,
+        "depth_range": list(args.depth_range) if args.depth_range is not None else None,
+        "shuffled": bool(args.shuffled),
         "splits": results,
     }
     # Positive gap = the flow assigns higher density to what it was fitted on, i.e.
@@ -319,6 +410,11 @@ def main():
                           ("trimmed_mean_log_prob_0.1pct", "trimmed_train_minus_test")):
             if key in tr and key in te:
                 summary[name] = tr[key] - te[key]
+        ftr, fte = tr.get("depth_filtered", {}), te.get("depth_filtered", {})
+        for key, name in (("mean_log_prob", "filtered_train_minus_test"),
+                          ("median_log_prob", "filtered_median_train_minus_test")):
+            if key in ftr and key in fte:
+                summary[name] = ftr[key] - fte[key]
 
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     args.output_path.write_text(json.dumps(summary, indent=2))
@@ -343,7 +439,22 @@ def main():
                   f"{worst_tail['threshold']:.1f}) carry "
                   f"{100 * worst_tail['variance_share']:.1f}% of the variance and "
                   f"{worst_tail['mean_shift']:+.4f} of the mean", flush=True)
-    for name in ("train_minus_test", "median_train_minus_test", "trimmed_train_minus_test"):
+        if "shuffled" in r:
+            sh = r["shuffled"]
+            print(f"       shuffled conditions: mean {sh['mean']:.4f} (var {sh['var']:.2f})  "
+                  f"median {sh['median']:.4f}  | true - shuffled: mean "
+                  f"{sh['mean_true_minus_shuffled']:+.4f}  median "
+                  f"{sh['median_true_minus_shuffled']:+.4f}", flush=True)
+        if "depth_filtered" in r and "mean_log_prob" in r["depth_filtered"]:
+            f = r["depth_filtered"]
+            print(f"       depth in {r['depth_range']}: kept {f['n_kept']} "
+                  f"({100 * f['frac_kept']:.1f}%) | mean {f['mean_log_prob']:.4f} "
+                  f"(var {f['var_log_prob']:.2f})  median {f['median_log_prob']:.4f}"
+                  + (f"  | shuffled mean {f['shuffled']['mean']:.4f} "
+                     f"(gap {f['shuffled']['mean_true_minus_shuffled']:+.4f})"
+                     if "shuffled" in f else ""), flush=True)
+    for name in ("train_minus_test", "median_train_minus_test", "trimmed_train_minus_test",
+                 "filtered_train_minus_test", "filtered_median_train_minus_test"):
         if name in summary:
             print(f"{name} = {summary[name]:.4f}", flush=True)
     print(f"-> {args.output_path}", flush=True)
