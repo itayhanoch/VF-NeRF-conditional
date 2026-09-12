@@ -123,7 +123,7 @@ def precompute_dino_cache(image_filenames, cache_dir: Path, extractor: DinoExtra
     return np.load(npy, mmap_mode="r"), h, w
 
 
-def sample_batch(cameras, dino_caches, batch_size, device):
+def sample_batch(cameras, dino_caches, batch_size, device, return_coords=False):
     """Random (image, sub-pixel) -> (RayBundle, condition[B, C]) on `device`.
 
     Pixels are drawn continuously over each image, not snapped to patch centres,
@@ -131,6 +131,10 @@ def sample_batch(cameras, dino_caches, batch_size, device):
     surfaces. The condition is the DINOv2 token of the 14x14 patch that pixel
     falls in -- the same nearest-cell lookup kaggle_explorer.py / gradio_app.py
     use at inference.
+
+    `return_coords=True` also returns the drawn (y, x) pixel coords [B, 2] (the
+    RayBundle does not carry them) -- the nearest-sample eval needs them to crop
+    the source frame for its montage.
     """
     grids, h, w = dino_caches  # grids: np.memmap [N, Hp, Wp, C] fp16
     n, hp, wp, _ = grids.shape
@@ -147,6 +151,8 @@ def sample_batch(cameras, dino_caches, batch_size, device):
     coords = torch.stack([ys, xs], dim=-1)  # (y, x) fractional pixel, matches Cameras.generate_rays
     camera_indices = img_idx.unsqueeze(-1)
     ray_bundle = cameras.generate_rays(camera_indices=camera_indices, coords=coords)
+    if return_coords:
+        return ray_bundle.to(device), conditions.to(device), coords.to(device)
     return ray_bundle.to(device), conditions.to(device)
 
 

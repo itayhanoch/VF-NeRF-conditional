@@ -21,16 +21,28 @@ likelihood eval, so the pixels, features and 3-D targets are exactly the trainin
 distribution. `--depth-range` repeats every statistic over only the samples whose
 NeRF depth is in range (the bad-depth outliers removed), as in the likelihood eval.
 
+DINO round-trip (`--dino-views N`): for N random pixels of the split (drawn from
+the depth-filtered ones), the `min` and `top` samples are each rendered through the
+frozen NeRF as a view looking along the sampled direction at the sampled point --
+a centred `--view-crop` window at the reference camera's native pixel pitch, so a
+DINO patch of the render covers the same footprint as the source patch -- and the
+DINOv2 feature of the patch the point lands in (the principal point) is compared
+by cosine with the feature that conditioned the sample: the explorer's `pt cos`
+as a statistic. Read the numbers against eval_dino_reconstruction.py's same-patch
+(ceiling) and random-patch (floor) cosines of the same scene and split.
+
 Cost: num_pixels * num_samples flow samples (40k x 100 = 4M), drawn in chunks of
 `pixel_chunk * num_samples`; the flow is a few small MLPs on a 6-D input, so this
 is a minute or two per split on a T4. The NeRF depth render is only num_pixels rays.
+The round-trip adds 2 * N crop renders (364^2 = 132k rays each) + DINO passes:
+~3 min per split for N = 200.
 
 Example:
     python scripts/eval_cond_nf_nearest_sample.py \\
         --nerf-config outputs/bonsai/nerfacto/TIMESTAMP/config.yml \\
         --scene-dir data/mipnerf360/bonsai \\
         --cond-nf-checkpoint checkpoints/conditional_nf/bonsai/latest.pt \\
-        --output-path eval/bonsai_cond_nf_nearest.json --depth-range 0.3 3.0
+        --output-path eval/bonsai_cond_nf_nearest.json --depth-range 0.3 3.0 --dino-views 200
 """
 import argparse
 import json
@@ -39,11 +51,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
-from nerfstudio.utils.dino_features import DinoExtractor
+from nerfstudio.cameras.cameras import Cameras
+from nerfstudio.utils.dino_features import DinoExtractor, load_image_chw_01, patch_pixel_box
 from nerfstudio.utils.eval_utils import eval_setup
 from scripts.eval_cond_nf_likelihood import basic_stats, load_conditional_nf
 from scripts.train_conditional_nf import build_training_cameras, precompute_dino_cache, sample_batch
+
+WORLD_UP = torch.tensor([0.0, 0.0, 1.0])   # the explorer's / gradio app's camera up
 
 
 def parse_args():
@@ -63,6 +79,9 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save-samples", dest="save_samples", action="store_true", default=True, help="Also write <output-path stem>_samples.npz with the per-pixel arrays (default: on)")
     p.add_argument("--no-save-samples", dest="save_samples", action="store_false")
+    p.add_argument("--dino-views", type=int, default=200, help="DINO round-trip: render the min and top samples of this many random pixels per split (drawn from the depth-filtered ones) and report the cosine between the landing patch's DINO feature and the source feature; 0 disables")
+    p.add_argument("--view-crop", type=int, default=364, help="Side of the square render window in pixels at the reference camera's native pitch (a multiple of the 14-px DINO patch; 364 = 26 patches)")
+    p.add_argument("--views-png-rows", type=int, default=6, help="Pixels shown in the per-split montage <output-path stem>_views_<split>.png (source crop | min render | top render); 0 disables")
     return p.parse_args()
 
 
@@ -82,10 +101,12 @@ def sample_errors(field, conditions, points, directions, num_samples, pixel_chun
 
     Returns dict of [B] tensors: {min,top}_dist / {min,top}_angle_deg, where
     `min` is the closest of the K samples (distance and angle separately) and
-    `top` is the sample with the highest log_prob under its own condition.
+    `top` is the sample with the highest log_prob under its own condition, plus
+    the [B, 6] samples themselves, {min,top}_sample (`min_sample` is the
+    closest-by-distance sample with its own direction), for the DINO round-trip.
     Non-finite samples are ignored (distance/angle -> inf, log_prob -> -inf).
     """
-    out = {f"{v}_{m}": [] for v in VARIANTS for m in ("dist", "angle_deg")}
+    out = {f"{v}_{m}": [] for v in VARIANTS for m in ("dist", "angle_deg", "sample")}
     for i in range(0, conditions.shape[0], pixel_chunk):
         cond = conditions[i:i + pixel_chunk]
         P, d = points[i:i + pixel_chunk], directions[i:i + pixel_chunk]
@@ -110,11 +131,14 @@ def sample_errors(field, conditions, points, directions, num_samples, pixel_chun
         lp = torch.where(ok, lp, torch.full_like(lp, float("-inf")))
 
         top = lp.argmax(dim=1)                                          # [B]
+        mn = dist.argmin(dim=1)                                         # [B]
         ar = torch.arange(B, device=s.device)
-        out["min_dist"].append(dist.min(dim=1).values)
+        out["min_dist"].append(dist[ar, mn])
         out["min_angle_deg"].append(angle.min(dim=1).values)
+        out["min_sample"].append(s[ar, mn])
         out["top_dist"].append(dist[ar, top])
         out["top_angle_deg"].append(angle[ar, top])
+        out["top_sample"].append(s[ar, top])
     return {k: torch.cat(v) for k, v in out.items()}
 
 
@@ -135,6 +159,181 @@ def variant_stats(arrays, mask, hit_threshold):
     return out
 
 
+def build_crop_camera(position, direction, reference_cameras, backoff, crop, world_up=WORLD_UP):
+    """The explorer's `build_camera_from_point_direction` (origin = P - forward *
+    backoff, looking along `direction`, world-Z up), but as a centred `crop` x
+    `crop` window at the reference camera's native pixel pitch: fx/fy are kept,
+    the principal point is the window centre, so P projects to (crop/2, crop/2)
+    and one DINO patch of the render covers the same footprint as a source patch.
+    """
+    device = position.device
+    forward = direction / direction.norm().clamp_min(1e-8)
+    up_ref = world_up.to(device)
+    if torch.abs(torch.dot(forward, up_ref)) > 0.99:
+        up_ref = torch.tensor([1.0, 0.0, 0.0], device=device)
+    right = torch.cross(forward, up_ref, dim=-1)
+    right = right / right.norm().clamp_min(1e-8)
+    up = torch.cross(right, forward, dim=-1)
+    origin = position - forward * backoff
+    rotation = torch.stack([right, up, -forward], dim=-1)
+    c2w = torch.cat([rotation, origin.unsqueeze(-1)], dim=-1)
+    half = crop / 2.0
+    return Cameras(
+        camera_to_worlds=c2w.unsqueeze(0),
+        fx=reference_cameras.fx[0:1], fy=reference_cameras.fy[0:1],
+        cx=torch.full_like(reference_cameras.cx[0:1], half),
+        cy=torch.full_like(reference_cameras.cy[0:1], half),
+        width=torch.full_like(reference_cameras.width[0:1], crop),
+        height=torch.full_like(reference_cameras.height[0:1], crop),
+        camera_type=reference_cameras.camera_type[0:1],
+    ).to(device)
+
+
+def patch_cell(grid, h, w, x, y):
+    """Nearest patch-grid cell for pixel (x, y) of an (h, w) image -> [EMBED_DIM];
+    the binning of `sample_batch` / the explorer, so the cell read here is the
+    one the condition would be read from."""
+    hp, wp = grid.shape[-2:]
+    py = min(max(int(y * hp / h), 0), hp - 1)
+    px = min(max(int(x * wp / w), 0), wp - 1)
+    return grid[:, py, px].reshape(-1), py, px
+
+
+def dino_round_trip(split, args, arrays, cond, cameras, image_filenames, dino_caches,
+                    nerf_model, extractor, out_png, device):
+    """Render the min / top samples of `args.dino_views` random pixels and score
+    the DINO feature of the landing patch against the source feature.
+
+    Returns (json block, {view_pixel_idx, view_min_cos, view_top_cos}).
+    """
+    depth = arrays["depth"]
+    cand = np.isfinite(depth) & np.isfinite(arrays["min_dist"]) & np.isfinite(arrays["top_dist"])
+    if args.depth_range is not None:
+        cand &= (depth >= args.depth_range[0]) & (depth <= args.depth_range[1])
+    idx = np.flatnonzero(cand)
+    n = min(args.dino_views, len(idx))
+    rng = np.random.default_rng(args.seed)
+    view_idx = np.sort(rng.choice(idx, n, replace=False)) if n else np.zeros(0, dtype=np.int64)
+    crop = args.view_crop
+    print(f"[{split}] DINO round-trip: {n} pixels x {len(VARIANTS)} renders of {crop}x{crop} "
+          f"(candidates {len(idx)}/{len(depth)})", flush=True)
+
+    cos = {v: np.full(n, np.nan, dtype=np.float32) for v in VARIANTS}
+    renders = {}
+    grid_hw = None
+    for j, i in enumerate(view_idx):
+        i = int(i)
+        t = float(depth[i])
+        cond_i = torch.from_numpy(cond[i].astype(np.float32)).to(device)
+        for v in VARIANTS:
+            s6 = torch.from_numpy(arrays[f"{v}_sample"][i]).to(device)
+            if not torch.isfinite(s6).all() or float(s6[3:].norm()) < 1e-8:
+                continue
+            cam = build_crop_camera(s6[:3], s6[3:], cameras, t, crop)
+            with torch.no_grad():
+                rb = cam.generate_rays(camera_indices=0)                     # [crop, crop]
+                rgb = nerf_model.get_outputs_for_camera_ray_bundle(rb)["rgb"].clamp(0, 1)
+                grid, _ = extractor.extract_patch_grid(rgb.permute(2, 0, 1).contiguous().cpu())
+            cell, py, px = patch_cell(grid, crop, crop, crop / 2.0, crop / 2.0)
+            grid_hw = tuple(int(v) for v in grid.shape[-2:])
+            cos[v][j] = float(F.cosine_similarity(cell.float().to(device), cond_i, dim=0))
+            if j < args.views_png_rows:
+                renders[(j, v)] = (rgb.cpu().numpy(), py, px)
+        if (j + 1) % 25 == 0 or (j + 1) == n:
+            print(f"[{split}] round-trip {j + 1}/{n} | running median cos min "
+                  f"{_finite_median(cos['min'][:j + 1]):.3f} top {_finite_median(cos['top'][:j + 1]):.3f}",
+                  flush=True)
+
+    block = {
+        "n_pixels": int(n),
+        "n_candidates": int(len(idx)),
+        "crop_px": crop,
+        "patch_grid": list(grid_hw) if grid_hw else None,
+        "backoff": "pixel_depth",
+        "restricted_to_depth_range": args.depth_range is not None,
+        "seed": args.seed,
+        "variants": {v: {"cos": basic_stats(cos[v]), "n_nonfinite": int((~np.isfinite(cos[v])).sum())}
+                     for v in VARIANTS},
+    }
+    diff = cos["min"] - cos["top"]
+    diff = diff[np.isfinite(diff)]
+    block["mean_min_minus_top"] = float(diff.mean()) if diff.size else float("nan")
+    block["median_min_minus_top"] = float(np.median(diff)) if diff.size else float("nan")
+    if renders and out_png is not None:
+        if save_views_montage(split, args, arrays, view_idx, cos, renders, image_filenames, dino_caches, out_png):
+            block["png"] = str(out_png)
+    extra = {"view_pixel_idx": view_idx.astype(np.int32)}
+    extra.update({f"view_{v}_cos": cos[v] for v in VARIANTS})
+    return block, extra
+
+
+def _finite_median(a):
+    a = np.asarray(a, dtype=np.float64)
+    a = a[np.isfinite(a)]
+    return float(np.median(a)) if a.size else float("nan")
+
+
+def save_views_montage(split, args, arrays, view_idx, cos, renders, image_filenames, dino_caches, out_png):
+    """One row per shown pixel: source crop (red box = the 14-px cell the condition
+    was read from, dot = the pixel) | min-dist render | top-logp render, the red
+    box on each render = the centre cell whose feature was scored. Returns False
+    (and skips the figure) when matplotlib is not installed."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        print(f"  ! no montage: {e!r}", flush=True)
+        return False
+
+    grids, h, w = dino_caches
+    hp, wp = grids.shape[1], grids.shape[2]
+    crop = args.view_crop
+    rows = min(args.views_png_rows, len(view_idx))
+    fig, axes = plt.subplots(rows, 1 + len(VARIANTS), figsize=(4.0 * (1 + len(VARIANTS)), 4.2 * rows), squeeze=False)
+    for r in range(rows):
+        i = int(view_idx[r])
+        y, x = (float(v) for v in arrays["pixel_yx"][i])
+        cam = int(arrays["cam_idx"][i])
+        img = load_image_chw_01(image_filenames[cam]).permute(1, 2, 0).numpy()
+        x0 = int(min(max(0, x - crop / 2), max(0, w - crop)))
+        y0 = int(min(max(0, y - crop / 2), max(0, h - crop)))
+        ax = axes[r, 0]
+        ax.imshow(img[y0:y0 + crop, x0:x0 + crop], extent=(x0, x0 + crop, y0 + crop, y0))
+        py = min(max(int(y * hp / h), 0), hp - 1)
+        px = min(max(int(x * wp / w), 0), wp - 1)
+        bx, by, sx, sy = patch_pixel_box(py, px, h, w)
+        ax.add_patch(plt.Rectangle((bx, by), sx, sy, fill=False, color="red", lw=1.5))
+        ax.plot([x], [y], marker=".", color="red", ms=4)
+        ax.set_title(f"{Path(image_filenames[cam]).name} [{split}] px ({x:.0f}, {y:.0f})\n"
+                     f"depth {float(arrays['depth'][i]):.3f}", fontsize=8.5)
+        ax.axis("off")
+        for c, v in enumerate(VARIANTS, start=1):
+            ax = axes[r, c]
+            hit = renders.get((r, v))
+            if hit is None:
+                ax.set_title(f"{v}: no render", fontsize=8.5)
+                ax.axis("off")
+                continue
+            rgb, cpy, cpx = hit
+            ax.imshow(rgb)
+            bx, by, sx, sy = patch_pixel_box(cpy, cpx, crop, crop)
+            ax.add_patch(plt.Rectangle((bx, by), sx, sy, fill=False, color="red", lw=1.5))
+            label = "min-dist sample" if v == "min" else "top-logp sample"
+            ax.set_title(f"{label}  cos {cos[v][r]:.3f}\n"
+                         f"dist {float(arrays[f'{v}_dist'][i]):.4f}  angle {float(arrays[f'{v}_angle_deg'][i]):.1f} deg",
+                         fontsize=8.5)
+            ax.axis("off")
+    fig.suptitle(f"{split}: DINO round-trip -- cosine between the centre patch of the render and the "
+                 f"source patch feature ({crop}px crops at native pitch)", fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.12 / rows))
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=100)
+    plt.close(fig)
+    print(f"-> {out_png}", flush=True)
+    return True
+
+
 def evaluate_split(split, args, config, nerf_model, field, extractor, backoff, device):
     cameras, image_filenames = build_training_cameras(
         args.scene_dir, config.pipeline.datamanager.dataparser, split=split
@@ -151,20 +350,25 @@ def evaluate_split(split, args, config, nerf_model, field, extractor, backoff, d
     nerf_model.to(device)
 
     torch.manual_seed(args.seed)
-    keep = {k: [] for k in ("depth", "cam_idx")}
-    keep.update({f"{v}_{m}": [] for v in VARIANTS for m in ("dist", "angle_deg")})
+    keep = {k: [] for k in ("depth", "cam_idx", "point", "direction", "pixel_yx")}
+    keep.update({f"{v}_{m}": [] for v in VARIANTS for m in ("dist", "angle_deg", "sample")})
+    conds = []   # fp16 [B, C] per batch, kept only for the round-trip (never written out)
     n_batches = math.ceil(args.num_pixels / args.ray_batch)
     done = 0
     for b in range(n_batches):
         bs = min(args.ray_batch, args.num_pixels - done)
         with torch.no_grad():
-            ray_bundle, conditions = sample_batch(cameras, dino_caches, bs, device)
+            ray_bundle, conditions, coords = sample_batch(cameras, dino_caches, bs, device, return_coords=True)
             depth = nerf_model(ray_bundle)["depth"].reshape(-1)                      # [B]
             points = ray_bundle.origins + ray_bundle.directions * depth[:, None]     # [B, 3]
             errs = sample_errors(field, conditions, points, ray_bundle.directions,
                                  args.num_samples, args.pixel_chunk)
         keep["depth"].append(depth.float().cpu().numpy())
         keep["cam_idx"].append(ray_bundle.camera_indices.reshape(-1).cpu().numpy())
+        keep["point"].append(points.float().cpu().numpy())
+        keep["direction"].append(ray_bundle.directions.float().cpu().numpy())
+        keep["pixel_yx"].append(coords.float().cpu().numpy())
+        conds.append(conditions.half().cpu().numpy())
         for k, v in errs.items():
             keep[k].append(v.float().cpu().numpy())
         done += bs
@@ -196,7 +400,16 @@ def evaluate_split(split, args, config, nerf_model, field, extractor, backoff, d
             "frac_kept": float(kept.mean()),
             "variants": variant_stats(arrays, kept, hit_threshold) if kept.any() else {},
         }
-    arrays = {k: (v.astype(np.int32) if k == "cam_idx" else v.astype(np.float32)) for k, v in arrays.items()}
+    if args.dino_views > 0:
+        cond = np.concatenate(conds)
+        png = (args.output_path.with_name(f"{args.output_path.stem}_views_{split}.png")
+               if args.views_png_rows > 0 else None)
+        out["dino_views"], extra = dino_round_trip(
+            split, args, arrays, cond, cameras, image_filenames, dino_caches,
+            nerf_model, extractor, png, device)
+        arrays.update(extra)
+    int_keys = {"cam_idx", "view_pixel_idx"}
+    arrays = {k: (v.astype(np.int32) if k in int_keys else v.astype(np.float32)) for k, v in arrays.items()}
     return out, arrays
 
 
@@ -263,6 +476,12 @@ def main():
                       f"median {ft['dist']['median']:.4f} | hits {ft['n_hit']} ({100 * ft['frac_hit']:.1f}%) "
                       f"| angle mean {ft['angle_deg']['mean']:.2f} var {ft['angle_deg']['var']:.2f} "
                       f"median {ft['angle_deg']['median']:.2f} deg", flush=True)
+        dv = r.get("dino_views")
+        if dv:
+            for v in VARIANTS:
+                c = dv["variants"][v]["cos"]
+                print(f"      round-trip {v:<4}: cos mean {c['mean']:.4f} var {c['var']:.4f} "
+                      f"median {c['median']:.4f} (n {c['n']}, non-finite {dv['variants'][v]['n_nonfinite']})", flush=True)
     print(f"-> {args.output_path}", flush=True)
 
 

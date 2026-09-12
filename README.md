@@ -326,6 +326,28 @@ For an external image only its DINOv2 feature at the clicked pixel is used -- th
 sampled novel views are still rendered as bonsai views through the frozen bonsai
 NeRF, so it is most useful when the external image shows similar content.
 
+### Scene scale reference
+
+Every evaluation number is in nerfstudio's normalized scene units. To give them a
+physical sense, pick the two ends of a recognisable object (a plate, a tile) on a
+frame of each scene -- twice per scene is plenty:
+
+```bash
+pip install matplotlib pillow remotezip
+python app/pick_scale_pairs.py --scenes counter kitchen room   # click A, then B on the same frame
+```
+
+Type an object name into the `label` box before the second click to tag the pair;
+the toolbar zoom is kept while you stay on a frame, so zoom in to place the points.
+It prints a `SCALE_PAIRS` block (`["name.ext", x1, y1, x2, y2, "TRAIN", "plate"]`
+rows per scene) to paste into
+[`notebooks/measure_scene_scale.ipynb`](notebooks/measure_scene_scale.ipynb), which
+restores the frozen NeRFs, shoots each frame's camera rays through A, B and their
+pixel midpoint M, and reports `|AB|` (normalized and original COLMAP units), `A-M`
+and `M-B` against `|AB|/2` (a flatness / depth-reliability check), the three depths,
+and the depth filter bounds and scene backoff in units of `|AB|`
+(`scripts/measure_scene_scale.py`; archived as `report_scene_scale.zip`).
+
 ### Reading a probe montage (cell 6b)
 
 One row per probe: the source frame (red box = the 14x14 DINO patch the condition
@@ -354,12 +376,14 @@ finishes. The scripts behind them run anywhere the stack is installed:
 |---|---|---|
 | 3c | `scripts/depth_probe.py` | what NeRF depth 0.3 / 3.0 looks like per scene (the outlier filter bounds): one frame, the same camera slid to those depths, and the depth map with contours |
 | 5b | `scripts/eval_cond_nf_likelihood.py --depth-range 0.3 3.0 --shuffled` | held-out log-likelihood, raw and with bad-depth samples filtered out, against a **shuffled-condition baseline** (same targets, another pixel's DINO feature -- does the flow use the feature at all?) |
-| 5c | `scripts/eval_cond_nf_nearest_sample.py` | the flow run the other way: 100 samples per pixel, distance / angle of the closest one (`min`) and of the flow's own top-ranked one (`top`) to the true point / direction, hit rate under 5 % of the scene backoff |
+| 5c | `scripts/eval_cond_nf_nearest_sample.py --dino-views 200` | the flow run the other way: 100 samples per pixel, distance / angle of the closest one (`min`) and of the flow's own top-ranked one (`top`) to the true point / direction, hit rate under 5 % of the scene backoff. **DINO round-trip**: for 200 random pixels per split the `min` and `top` samples are rendered through the frozen NeRF (a 364-px window at native pixel pitch, looking along the sampled direction at the sampled point) and the DINO feature of the patch the point lands in is scored by cosine against the source feature -- read against 6c's same-patch ceiling and random-patch floor; montage `*_views_<split>.png` |
 | 6c | `scripts/eval_dino_reconstruction.py` | can DINO on a NeRF render be trusted: same-patch cosine between a real frame and its render (ceiling) vs. a random render patch (floor) |
 
 The standalone [`notebooks/eval_cond_nf_likelihood.ipynb`](notebooks/eval_cond_nf_likelihood.ipynb)
 and [`notebooks/eval_dino_reconstruction.ipynb`](notebooks/eval_dino_reconstruction.ipynb)
-run 5b and 6c against restored checkpoints without training anything.
+run 5b and 6c against restored checkpoints without training anything;
+[`notebooks/measure_scene_scale.ipynb`](notebooks/measure_scene_scale.ipynb) does the same
+for the scene scale reference above (`report_scene_scale.zip`).
 
 
 # Built On
