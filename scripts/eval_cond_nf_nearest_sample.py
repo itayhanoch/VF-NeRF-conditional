@@ -21,9 +21,11 @@ likelihood eval, so the pixels, features and 3-D targets are exactly the trainin
 distribution. `--depth-range` repeats every statistic over only the samples whose
 NeRF depth is in range (the bad-depth outliers removed), as in the likelihood eval.
 
-DINO round-trip (`--dino-views N`): for N random pixels of the split (drawn from
-the depth-filtered ones), the `min` and `top` samples are each rendered through the
-frozen NeRF as a view looking along the sampled direction at the sampled point --
+DINO round-trip (`--dino-views N`): for the N best pixels of each pool -- the
+`min` pool ranked by the min sample's distance and angle, the `top` pool by the
+top sample's, each pixel scored by its distance rank plus its angle rank, over
+the depth-filtered pixels -- that pool's sample is rendered through the frozen
+NeRF as a view looking along the sampled direction at the sampled point --
 a centred `--view-crop` window at the reference camera's native pixel pitch, so a
 DINO patch of the render covers the same footprint as the source patch -- and the
 DINOv2 feature of the patch the point lands in (the principal point) is compared
@@ -35,7 +37,8 @@ Cost: num_pixels * num_samples flow samples (40k x 100 = 4M), drawn in chunks of
 `pixel_chunk * num_samples`; the flow is a few small MLPs on a 6-D input, so this
 is a minute or two per split on a T4. The NeRF depth render is only num_pixels rays.
 The round-trip adds 2 * N crop renders (364^2 = 132k rays each) + DINO passes:
-~3 min per split for N = 200.
+~3 min per split for N = 200. Because the pixels are the flow's best cases, the
+cosine answers "when the sample is geometrically right, does the appearance match?".
 
 Example:
     python scripts/eval_cond_nf_nearest_sample.py \\
@@ -79,7 +82,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save-samples", dest="save_samples", action="store_true", default=True, help="Also write <output-path stem>_samples.npz with the per-pixel arrays (default: on)")
     p.add_argument("--no-save-samples", dest="save_samples", action="store_false")
-    p.add_argument("--dino-views", type=int, default=200, help="DINO round-trip: render the min and top samples of this many random pixels per split (drawn from the depth-filtered ones) and report the cosine between the landing patch's DINO feature and the source feature; 0 disables")
+    p.add_argument("--dino-views", type=int, default=200, help="DINO round-trip: for the min pool and the top pool separately, render the sample of this many best pixels (smallest combined rank of distance and angle over the depth-filtered pixels) and report the cosine between the landing patch's DINO feature and the source feature; 0 disables")
     p.add_argument("--view-crop", type=int, default=364, help="Side of the square render window in pixels at the reference camera's native pitch (a multiple of the 14-px DINO patch; 364 = 26 patches)")
     p.add_argument("--views-png-rows", type=int, default=6, help="Pixels shown in the per-split montage <output-path stem>_views_<split>.png (source crop | min render | top render); 0 disables")
     return p.parse_args()
@@ -199,71 +202,98 @@ def patch_cell(grid, h, w, x, y):
     return grid[:, py, px].reshape(-1), py, px
 
 
+def select_best_pixels(arrays, variant, n, depth_range):
+    """The `n` pixels whose `variant` sample is best on distance AND angle: the
+    pool is every pixel with finite depth (inside `depth_range` when given) and
+    finite distance / angle; each pixel gets its rank by distance plus its rank
+    by angle, and the `n` smallest sums win (best first). Returns (indices, pool size)."""
+    depth = arrays["depth"]
+    dist, ang = arrays[f"{variant}_dist"], arrays[f"{variant}_angle_deg"]
+    cand = np.isfinite(depth) & np.isfinite(dist) & np.isfinite(ang)
+    if depth_range is not None:
+        cand &= (depth >= depth_range[0]) & (depth <= depth_range[1])
+    pool = np.flatnonzero(cand)
+    if not pool.size:
+        return np.zeros(0, dtype=np.int64), 0
+    rank_d = np.argsort(np.argsort(dist[pool], kind="stable"), kind="stable")
+    rank_a = np.argsort(np.argsort(ang[pool], kind="stable"), kind="stable")
+    order = np.argsort(rank_d + rank_a, kind="stable")[:n]
+    return pool[order], int(pool.size)
+
+
 def dino_round_trip(split, args, arrays, cond, cameras, image_filenames, dino_caches,
                     nerf_model, extractor, out_png, device):
-    """Render the min / top samples of `args.dino_views` random pixels and score
-    the DINO feature of the landing patch against the source feature.
+    """Render, for each variant, that variant's sample of the `args.dino_views`
+    best pixels (smallest combined rank of distance and angle -- the min pool
+    and the top pool are chosen separately) and score the DINO feature of the
+    landing patch against the source feature.
 
-    Returns (json block, {view_pixel_idx, view_min_cos, view_top_cos}).
+    Returns (json block, {view_{v}_pixel_idx, view_{v}_cos}).
     """
-    depth = arrays["depth"]
-    cand = np.isfinite(depth) & np.isfinite(arrays["min_dist"]) & np.isfinite(arrays["top_dist"])
-    if args.depth_range is not None:
-        cand &= (depth >= args.depth_range[0]) & (depth <= args.depth_range[1])
-    idx = np.flatnonzero(cand)
-    n = min(args.dino_views, len(idx))
-    rng = np.random.default_rng(args.seed)
-    view_idx = np.sort(rng.choice(idx, n, replace=False)) if n else np.zeros(0, dtype=np.int64)
     crop = args.view_crop
-    print(f"[{split}] DINO round-trip: {n} pixels x {len(VARIANTS)} renders of {crop}x{crop} "
-          f"(candidates {len(idx)}/{len(depth)})", flush=True)
+    sel, n_pool = {}, {}
+    for v in VARIANTS:
+        sel[v], n_pool[v] = select_best_pixels(arrays, v, args.dino_views, args.depth_range)
+    print(f"[{split}] DINO round-trip: " + ", ".join(
+        f"{v}: best {len(sel[v])} of {n_pool[v]}" for v in VARIANTS) +
+        f" pixels, one {crop}x{crop} render each", flush=True)
 
-    cos = {v: np.full(n, np.nan, dtype=np.float32) for v in VARIANTS}
-    renders = {}
+    cos = {v: np.full(len(sel[v]), np.nan, dtype=np.float32) for v in VARIANTS}
+    renders = {v: {} for v in VARIANTS}
     grid_hw = None
-    for j, i in enumerate(view_idx):
-        i = int(i)
-        t = float(depth[i])
-        cond_i = torch.from_numpy(cond[i].astype(np.float32)).to(device)
-        for v in VARIANTS:
+    for v in VARIANTS:
+        n = len(sel[v])
+        for j, i in enumerate(sel[v]):
+            i = int(i)
+            t = float(arrays["depth"][i])
+            cond_i = torch.from_numpy(cond[i].astype(np.float32)).to(device)
             s6 = torch.from_numpy(arrays[f"{v}_sample"][i]).to(device)
-            if not torch.isfinite(s6).all() or float(s6[3:].norm()) < 1e-8:
-                continue
-            cam = build_crop_camera(s6[:3], s6[3:], cameras, t, crop)
-            with torch.no_grad():
-                rb = cam.generate_rays(camera_indices=0)                     # [crop, crop]
-                rgb = nerf_model.get_outputs_for_camera_ray_bundle(rb)["rgb"].clamp(0, 1)
-                grid, _ = extractor.extract_patch_grid(rgb.permute(2, 0, 1).contiguous().cpu())
-            cell, py, px = patch_cell(grid, crop, crop, crop / 2.0, crop / 2.0)
-            grid_hw = tuple(int(v) for v in grid.shape[-2:])
-            cos[v][j] = float(F.cosine_similarity(cell.float().to(device), cond_i, dim=0))
-            if j < args.views_png_rows:
-                renders[(j, v)] = (rgb.cpu().numpy(), py, px)
-        if (j + 1) % 25 == 0 or (j + 1) == n:
-            print(f"[{split}] round-trip {j + 1}/{n} | running median cos min "
-                  f"{_finite_median(cos['min'][:j + 1]):.3f} top {_finite_median(cos['top'][:j + 1]):.3f}",
-                  flush=True)
+            if torch.isfinite(s6).all() and float(s6[3:].norm()) >= 1e-8:
+                cam = build_crop_camera(s6[:3], s6[3:], cameras, t, crop)
+                with torch.no_grad():
+                    rb = cam.generate_rays(camera_indices=0)                     # [crop, crop]
+                    rgb = nerf_model.get_outputs_for_camera_ray_bundle(rb)["rgb"].clamp(0, 1)
+                    grid, _ = extractor.extract_patch_grid(rgb.permute(2, 0, 1).contiguous().cpu())
+                cell, py, px = patch_cell(grid, crop, crop, crop / 2.0, crop / 2.0)
+                grid_hw = tuple(int(g) for g in grid.shape[-2:])
+                cos[v][j] = float(F.cosine_similarity(cell.float().to(device), cond_i, dim=0))
+                if j < args.views_png_rows:
+                    renders[v][j] = (rgb.cpu().numpy(), py, px)
+            if (j + 1) % 25 == 0 or (j + 1) == n:
+                print(f"[{split}] round-trip {v} {j + 1}/{n} | running median cos "
+                      f"{_finite_median(cos[v][:j + 1]):.3f}", flush=True)
+
+    def _with_extrema(vals):
+        st = basic_stats(vals)
+        vals = np.asarray(vals, dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        st["min"] = float(vals.min()) if vals.size else float("nan")
+        st["max"] = float(vals.max()) if vals.size else float("nan")
+        return st
 
     block = {
-        "n_pixels": int(n),
-        "n_candidates": int(len(idx)),
+        "selection": "best_by_combined_rank_of_dist_and_angle",
+        "n_requested": args.dino_views,
         "crop_px": crop,
         "patch_grid": list(grid_hw) if grid_hw else None,
         "backoff": "pixel_depth",
         "restricted_to_depth_range": args.depth_range is not None,
-        "seed": args.seed,
-        "variants": {v: {"cos": basic_stats(cos[v]), "n_nonfinite": int((~np.isfinite(cos[v])).sum())}
-                     for v in VARIANTS},
+        "variants": {v: {
+            "n_pixels": int(len(sel[v])),
+            "n_candidates": n_pool[v],
+            "cos": basic_stats(cos[v]),
+            "n_nonfinite": int((~np.isfinite(cos[v])).sum()),
+            "selected_dist": _with_extrema(arrays[f"{v}_dist"][sel[v]]),
+            "selected_angle_deg": _with_extrema(arrays[f"{v}_angle_deg"][sel[v]]),
+        } for v in VARIANTS},
     }
-    diff = cos["min"] - cos["top"]
-    diff = diff[np.isfinite(diff)]
-    block["mean_min_minus_top"] = float(diff.mean()) if diff.size else float("nan")
-    block["median_min_minus_top"] = float(np.median(diff)) if diff.size else float("nan")
-    if renders and out_png is not None:
-        if save_views_montage(split, args, arrays, view_idx, cos, renders, image_filenames, dino_caches, out_png):
+    if any(renders.values()) and out_png is not None:
+        if save_views_montage(split, args, arrays, sel, cos, renders, image_filenames, dino_caches, out_png):
             block["png"] = str(out_png)
-    extra = {"view_pixel_idx": view_idx.astype(np.int32)}
-    extra.update({f"view_{v}_cos": cos[v] for v in VARIANTS})
+    extra = {}
+    for v in VARIANTS:
+        extra[f"view_{v}_pixel_idx"] = sel[v].astype(np.int32)
+        extra[f"view_{v}_cos"] = cos[v]
     return block, extra
 
 
@@ -273,11 +303,11 @@ def _finite_median(a):
     return float(np.median(a)) if a.size else float("nan")
 
 
-def save_views_montage(split, args, arrays, view_idx, cos, renders, image_filenames, dino_caches, out_png):
-    """One row per shown pixel: source crop (red box = the 14-px cell the condition
-    was read from, dot = the pixel) | min-dist render | top-logp render, the red
-    box on each render = the centre cell whose feature was scored. Returns False
-    (and skips the figure) when matplotlib is not installed."""
+def save_views_montage(split, args, arrays, sel, cos, renders, image_filenames, dino_caches, out_png):
+    """Row r = the r-th best pixel of each pool; per pool a column pair: the
+    source crop (red box = the 14-px cell the condition was read from, dot = the
+    pixel) | that pool's render (red box = the centre cell whose feature was
+    scored). Returns False (and skips the figure) when matplotlib is missing."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -289,43 +319,47 @@ def save_views_montage(split, args, arrays, view_idx, cos, renders, image_filena
     grids, h, w = dino_caches
     hp, wp = grids.shape[1], grids.shape[2]
     crop = args.view_crop
-    rows = min(args.views_png_rows, len(view_idx))
-    fig, axes = plt.subplots(rows, 1 + len(VARIANTS), figsize=(4.0 * (1 + len(VARIANTS)), 4.2 * rows), squeeze=False)
+    rows = min(args.views_png_rows, max(len(sel[v]) for v in VARIANTS))
+    ncol = 2 * len(VARIANTS)
+    fig, axes = plt.subplots(rows, ncol, figsize=(4.0 * ncol, 4.2 * rows), squeeze=False)
     for r in range(rows):
-        i = int(view_idx[r])
-        y, x = (float(v) for v in arrays["pixel_yx"][i])
-        cam = int(arrays["cam_idx"][i])
-        img = load_image_chw_01(image_filenames[cam]).permute(1, 2, 0).numpy()
-        x0 = int(min(max(0, x - crop / 2), max(0, w - crop)))
-        y0 = int(min(max(0, y - crop / 2), max(0, h - crop)))
-        ax = axes[r, 0]
-        ax.imshow(img[y0:y0 + crop, x0:x0 + crop], extent=(x0, x0 + crop, y0 + crop, y0))
-        py = min(max(int(y * hp / h), 0), hp - 1)
-        px = min(max(int(x * wp / w), 0), wp - 1)
-        bx, by, sx, sy = patch_pixel_box(py, px, h, w)
-        ax.add_patch(plt.Rectangle((bx, by), sx, sy, fill=False, color="red", lw=1.5))
-        ax.plot([x], [y], marker=".", color="red", ms=4)
-        ax.set_title(f"{Path(image_filenames[cam]).name} [{split}] px ({x:.0f}, {y:.0f})\n"
-                     f"depth {float(arrays['depth'][i]):.3f}", fontsize=8.5)
-        ax.axis("off")
-        for c, v in enumerate(VARIANTS, start=1):
-            ax = axes[r, c]
-            hit = renders.get((r, v))
+        for k, v in enumerate(VARIANTS):
+            ax_src, ax_nv = axes[r, 2 * k], axes[r, 2 * k + 1]
+            label = "min-dist" if v == "min" else "top-logp"
+            if r >= len(sel[v]):
+                ax_src.axis("off"); ax_nv.axis("off")
+                continue
+            i = int(sel[v][r])
+            y, x = (float(c) for c in arrays["pixel_yx"][i])
+            cam = int(arrays["cam_idx"][i])
+            img = load_image_chw_01(image_filenames[cam]).permute(1, 2, 0).numpy()
+            x0 = int(min(max(0, x - crop / 2), max(0, w - crop)))
+            y0 = int(min(max(0, y - crop / 2), max(0, h - crop)))
+            ax_src.imshow(img[y0:y0 + crop, x0:x0 + crop], extent=(x0, x0 + crop, y0 + crop, y0))
+            py = min(max(int(y * hp / h), 0), hp - 1)
+            px = min(max(int(x * wp / w), 0), wp - 1)
+            bx, by, sx, sy = patch_pixel_box(py, px, h, w)
+            ax_src.add_patch(plt.Rectangle((bx, by), sx, sy, fill=False, color="red", lw=1.5))
+            ax_src.plot([x], [y], marker=".", color="red", ms=4)
+            ax_src.set_title(f"{label} #{r + 1}: {Path(image_filenames[cam]).name} [{split}]\n"
+                             f"px ({x:.0f}, {y:.0f})  depth {float(arrays['depth'][i]):.3f}", fontsize=8.5)
+            ax_src.axis("off")
+            hit = renders[v].get(r)
             if hit is None:
-                ax.set_title(f"{v}: no render", fontsize=8.5)
-                ax.axis("off")
+                ax_nv.set_title(f"{label} sample: no render", fontsize=8.5)
+                ax_nv.axis("off")
                 continue
             rgb, cpy, cpx = hit
-            ax.imshow(rgb)
+            ax_nv.imshow(rgb)
             bx, by, sx, sy = patch_pixel_box(cpy, cpx, crop, crop)
-            ax.add_patch(plt.Rectangle((bx, by), sx, sy, fill=False, color="red", lw=1.5))
-            label = "min-dist sample" if v == "min" else "top-logp sample"
-            ax.set_title(f"{label}  cos {cos[v][r]:.3f}\n"
-                         f"dist {float(arrays[f'{v}_dist'][i]):.4f}  angle {float(arrays[f'{v}_angle_deg'][i]):.1f} deg",
-                         fontsize=8.5)
-            ax.axis("off")
-    fig.suptitle(f"{split}: DINO round-trip -- cosine between the centre patch of the render and the "
-                 f"source patch feature ({crop}px crops at native pitch)", fontsize=10)
+            ax_nv.add_patch(plt.Rectangle((bx, by), sx, sy, fill=False, color="red", lw=1.5))
+            ax_nv.set_title(f"{label} sample  cos {cos[v][r]:.3f}\n"
+                            f"dist {float(arrays[f'{v}_dist'][i]):.4f}  angle {float(arrays[f'{v}_angle_deg'][i]):.1f} deg",
+                            fontsize=8.5)
+            ax_nv.axis("off")
+    fig.suptitle(f"{split}: DINO round-trip on the best {args.dino_views} pixels of each pool (combined "
+                 f"distance + angle rank) -- cosine between the centre patch of the render and the source "
+                 f"patch feature ({crop}px crops at native pitch)", fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, 1 - 0.12 / rows))
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=100)
@@ -408,7 +442,7 @@ def evaluate_split(split, args, config, nerf_model, field, extractor, backoff, d
             split, args, arrays, cond, cameras, image_filenames, dino_caches,
             nerf_model, extractor, png, device)
         arrays.update(extra)
-    int_keys = {"cam_idx", "view_pixel_idx"}
+    int_keys = {"cam_idx"} | {f"view_{v}_pixel_idx" for v in VARIANTS}
     arrays = {k: (v.astype(np.int32) if k in int_keys else v.astype(np.float32)) for k, v in arrays.items()}
     return out, arrays
 
@@ -479,9 +513,12 @@ def main():
         dv = r.get("dino_views")
         if dv:
             for v in VARIANTS:
-                c = dv["variants"][v]["cos"]
-                print(f"      round-trip {v:<4}: cos mean {c['mean']:.4f} var {c['var']:.4f} "
-                      f"median {c['median']:.4f} (n {c['n']}, non-finite {dv['variants'][v]['n_nonfinite']})", flush=True)
+                b = dv["variants"][v]
+                c = b["cos"]
+                print(f"      round-trip {v:<4} (best {b['n_pixels']} of {b['n_candidates']}; dist <= "
+                      f"{b['selected_dist']['max']:.4f}, angle <= {b['selected_angle_deg']['max']:.2f} deg): "
+                      f"cos mean {c['mean']:.4f} var {c['var']:.4f} median {c['median']:.4f} "
+                      f"(n {c['n']}, non-finite {b['n_nonfinite']})", flush=True)
     print(f"-> {args.output_path}", flush=True)
 
 
