@@ -26,7 +26,7 @@ from PIL import Image, ImageDraw
 
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.fields.nf_field import ConditionalNFField
-from nerfstudio.utils.dino_features import DinoExtractor, load_image_chw_01
+from nerfstudio.utils.dino_features import DinoExtractor, load_image_chw_01, pixel_to_patch_cell
 from nerfstudio.utils.eval_utils import eval_setup
 
 TOP_K_SHOWN = 20  # of the sampled candidates, how many (ranked) to show for selection
@@ -168,12 +168,12 @@ class InteractiveApp:
     def _pixel_to_patch_feature(grid: torch.Tensor, h: int, w: int, x: int, y: int) -> torch.Tensor:
         """Pixel (x=col, y=row) -> the DINO feature of the patch cell it falls in.
 
-        Indexes the patch grid directly (same as the NF trainer's sample_batch); no
-        per-pixel upsampled map, and matches training-time condition semantics.
+        Indexes the patch grid directly with `pixel_to_patch_cell` (same binning as
+        the NF trainer's sample_batch); no per-pixel upsampled map, and matches
+        training-time condition semantics.
         """
         hp, wp = grid.shape[-2:]
-        px = min(max(int(x * wp / w), 0), wp - 1)
-        py = min(max(int(y * hp / h), 0), hp - 1)
+        py, px = pixel_to_patch_cell(y, x, h, w, hp, wp)
         return grid[:, py, px].reshape(-1).clone()
 
     def _probe_depth(self, cam_idx: int, x: int, y: int, img_h: int, img_w: int) -> float:

@@ -80,6 +80,39 @@ def patch_pixel_box(py, px, h: int, w: int):
     return px * side, py * side, side, side
 
 
+def pixel_to_patch_cell(y, x, h: int, w: int, hp: Optional[int] = None, wp: Optional[int] = None):
+    """Pixel (y, x) of an image whose NATIVE size is (h, w) -> (py, px), the patch
+    cell it falls in. The exact inverse of `patch_pixel_box`: the box of the
+    returned cell always contains the pixel.
+
+    Cells are `PATCH_SIZE / scale` native pixels wide (14 at native resolution),
+    so the index is floor(y / side) -- NOT `y * hp / h`. The grid is padded to a
+    multiple of 14, so `hp * side >= h`; dividing by `hp / h` spreads the image
+    over the padded grid and drifts by up to one cell toward the bottom/right
+    (on a 1557x1038 frame, 75x112 cells, ~65% of pixels land in the neighbour
+    cell). `hp` / `wp`, when given, clamp the result into the grid.
+
+    `y` / `x` may be numbers or tensors (the arithmetic broadcasts; tensors come
+    back as int64). Inputs are non-negative, so truncation is floor.
+    """
+    scale = min(1.0, MAX_DINO_SIDE / max(h, w))
+    side = PATCH_SIZE / scale
+    py, px = y / side, x / side
+    if torch.is_tensor(py) or torch.is_tensor(px):
+        py, px = torch.as_tensor(py).long(), torch.as_tensor(px).long()
+        if hp is not None:
+            py = py.clamp(0, hp - 1)
+        if wp is not None:
+            px = px.clamp(0, wp - 1)
+        return py, px
+    py, px = int(py), int(px)
+    if hp is not None:
+        py = min(max(py, 0), hp - 1)
+    if wp is not None:
+        px = min(max(px, 0), wp - 1)
+    return py, px
+
+
 def _normalize_for_dinov2(rgb_chw_01: torch.Tensor) -> torch.Tensor:
     """[3,H,W] in [0,1] -> normalized with DINOv2's ImageNet stats (required --
     DINOv2 was pretrained on inputs preprocessed this exact way)."""
@@ -106,7 +139,8 @@ class DinoExtractor:
 
         (h, w) is the image's ORIGINAL pixel shape (before any MAX_DINO_SIDE
         downscale or patch-multiple padding); callers map a pixel to its patch
-        cell with `Hp/h`, `Wp/w`. Uses
+        cell with `pixel_to_patch_cell(y, x, h, w)` (never `Hp/h`: the grid is
+        padded, so that ratio is not the cell pitch). Uses
         model.get_intermediate_layers(x, n=1, reshape=True, return_class_token=False)
         -- the hub model's documented way to get the last block's normalized patch
         tokens pre-reshaped to a spatial grid.

@@ -57,7 +57,7 @@ import torch
 import torch.nn.functional as F
 
 from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.utils.dino_features import DinoExtractor, load_image_chw_01, patch_pixel_box
+from nerfstudio.utils.dino_features import DinoExtractor, load_image_chw_01, patch_pixel_box, pixel_to_patch_cell
 from nerfstudio.utils.eval_utils import eval_setup
 from scripts.eval_cond_nf_likelihood import basic_stats, load_conditional_nf
 from scripts.train_conditional_nf import build_training_cameras, precompute_dino_cache, sample_batch
@@ -197,8 +197,7 @@ def patch_cell(grid, h, w, x, y):
     the binning of `sample_batch` / the explorer, so the cell read here is the
     one the condition would be read from."""
     hp, wp = grid.shape[-2:]
-    py = min(max(int(y * hp / h), 0), hp - 1)
-    px = min(max(int(x * wp / w), 0), wp - 1)
+    py, px = pixel_to_patch_cell(y, x, h, w, hp, wp)
     return grid[:, py, px].reshape(-1), py, px
 
 
@@ -336,8 +335,7 @@ def save_views_montage(split, args, arrays, sel, cos, renders, image_filenames, 
             x0 = int(min(max(0, x - crop / 2), max(0, w - crop)))
             y0 = int(min(max(0, y - crop / 2), max(0, h - crop)))
             ax_src.imshow(img[y0:y0 + crop, x0:x0 + crop], extent=(x0, x0 + crop, y0 + crop, y0))
-            py = min(max(int(y * hp / h), 0), hp - 1)
-            px = min(max(int(x * wp / w), 0), wp - 1)
+            py, px = pixel_to_patch_cell(y, x, h, w, hp, wp)
             bx, by, sx, sy = patch_pixel_box(py, px, h, w)
             ax_src.add_patch(plt.Rectangle((bx, by), sx, sy, fill=False, color="red", lw=1.5))
             ax_src.plot([x], [y], marker=".", color="red", ms=4)

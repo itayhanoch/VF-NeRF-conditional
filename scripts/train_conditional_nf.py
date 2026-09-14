@@ -33,7 +33,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
 from nerfstudio.fields.nf_field import ConditionalNFField
-from nerfstudio.utils.dino_features import DinoExtractor, load_image_chw_01
+from nerfstudio.utils.dino_features import DinoExtractor, load_image_chw_01, pixel_to_patch_cell
 from nerfstudio.utils.eval_utils import eval_setup
 
 
@@ -142,8 +142,7 @@ def sample_batch(cameras, dino_caches, batch_size, device, return_coords=False):
     img_idx = torch.randint(0, n, (batch_size,))
     ys = torch.rand(batch_size) * h
     xs = torch.rand(batch_size) * w
-    py = (ys * (hp / h)).long().clamp_(0, hp - 1)
-    px = (xs * (wp / w)).long().clamp_(0, wp - 1)
+    py, px = pixel_to_patch_cell(ys, xs, h, w, hp, wp)
 
     cond_np = grids[img_idx.numpy(), py.numpy(), px.numpy()].astype(np.float32)  # [B, C]
     conditions = torch.from_numpy(cond_np)
